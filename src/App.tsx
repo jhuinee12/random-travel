@@ -107,6 +107,8 @@ const TRANSPORT_SEARCH_CONFIG: Record<string, TransportSearchConfig> = {
   },
 };
 
+const DEFAULT_DESTINATION_KEYWORDS = ["관광지", "명소", "공원", "전시관", "시장"];
+
 function getDurationHours(duration: string): number {
   if (duration === "2박 3일") return 30;
   if (duration === "1박 2일") return 16;
@@ -125,8 +127,9 @@ function getDistanceWindowKm(transportKey: string, duration: string): { minKm: n
   };
   const hardCap = hardCaps[transportKey] ?? 900;
   const maxKm = Math.max(2, Math.min(hardCap, speed * hours));
-  const minRatio = transportType === "public" ? 0.22 : 0.08;
-  const minFloor = transportType === "public" ? 12 : 0.5;
+  const isShortRangePublic = transportKey === "subway" || transportKey === "bus";
+  const minRatio = transportType === "public" ? (isShortRangePublic ? 0.05 : 0.12) : 0.05;
+  const minFloor = transportType === "public" ? (isShortRangePublic ? 1 : 6) : 0.3;
   const minKm = Math.min(maxKm * 0.85, Math.max(minFloor, maxKm * minRatio));
   return { minKm, maxKm, targetKm: (minKm + maxKm) / 2 };
 }
@@ -439,19 +442,19 @@ async function fetchDestinationPool(
   windowKm: { minKm: number; maxKm: number }
 ): Promise<KakaoPlace[]> {
   const config = TRANSPORT_SEARCH_CONFIG[transportKey];
-  if (!config) return [];
-  const nearby = await collectKeywordPlaces(config.destinationKeywords, {
+  const keywords = config?.destinationKeywords?.length ? config.destinationKeywords : DEFAULT_DESTINATION_KEYWORDS;
+  const nearby = await collectKeywordPlaces(keywords, {
     lat: origin.lat,
     lng: origin.lng,
     radiusMeters: 20000,
-    pages: 2,
+    pages: 1,
     sort: "distance",
   });
-  const nationwide = await collectKeywordPlaces(config.destinationKeywords, {
-    pages: 2,
+  const nationwide = await collectKeywordPlaces(keywords, {
+    pages: 1,
     sort: "accuracy",
   });
-  return [...nearby, ...nationwide]
+  let filtered = [...nearby, ...nationwide]
     .filter((place) => {
       const km = haversine(origin.lat, origin.lng, place.lat, place.lng);
       return km >= windowKm.minKm && km <= windowKm.maxKm;
@@ -461,6 +464,15 @@ async function fetchDestinationPool(
       const bKm = haversine(origin.lat, origin.lng, b.lat, b.lng);
       return aKm - bKm;
     });
+  if (filtered.length > 0) return filtered;
+  filtered = [...nearby, ...nationwide]
+    .filter((place) => haversine(origin.lat, origin.lng, place.lat, place.lng) <= windowKm.maxKm * 1.5)
+    .sort((a, b) => {
+      const aKm = haversine(origin.lat, origin.lng, a.lat, a.lng);
+      const bKm = haversine(origin.lat, origin.lng, b.lat, b.lng);
+      return aKm - bKm;
+    });
+  return filtered;
 }
 
 async function fetchDestinationUniverse(
@@ -468,20 +480,27 @@ async function fetchDestinationUniverse(
   transportKey: string
 ): Promise<KakaoPlace[]> {
   const config = TRANSPORT_SEARCH_CONFIG[transportKey];
-  if (!config) return [];
-  const nearby = await collectKeywordPlaces(config.destinationKeywords, {
+  const keywords = config?.destinationKeywords?.length ? config.destinationKeywords : DEFAULT_DESTINATION_KEYWORDS;
+  const nearby = await collectKeywordPlaces(keywords, {
     lat: center.lat,
     lng: center.lng,
     radiusMeters: 20000,
     pages: 1,
     sort: "distance",
   });
-  const nationwide = await collectKeywordPlaces(config.destinationKeywords, {
+  const nationwide = await collectKeywordPlaces(keywords, {
     pages: 1,
     sort: "accuracy",
   });
+  const genericNear = await collectKeywordPlaces(DEFAULT_DESTINATION_KEYWORDS, {
+    lat: center.lat,
+    lng: center.lng,
+    radiusMeters: 20000,
+    pages: 1,
+    sort: "distance",
+  });
   const uniq = new Map<string, KakaoPlace>();
-  for (const place of [...nearby, ...nationwide]) {
+  for (const place of [...nearby, ...nationwide, ...genericNear]) {
     const key = placeKeyOf(place);
     if (!uniq.has(key)) uniq.set(key, place);
   }
@@ -496,6 +515,18 @@ function filterByDistanceWindow(
   return places.filter((place) => {
     const km = haversine(origin.lat, origin.lng, place.lat, place.lng);
     return km >= windowKm.minKm && km <= windowKm.maxKm;
+  });
+}
+
+function rankPlacesByTargetDistance(
+  origin: { lat: number; lng: number },
+  places: KakaoPlace[],
+  targetKm: number
+): KakaoPlace[] {
+  return [...places].sort((a, b) => {
+    const aKm = haversine(origin.lat, origin.lng, a.lat, a.lng);
+    const bKm = haversine(origin.lat, origin.lng, b.lat, b.lng);
+    return Math.abs(aKm - targetKm) - Math.abs(bKm - targetKm);
   });
 }
 
@@ -1119,7 +1150,9 @@ export default function App() {
             destPool = filterByDistanceWindow(origin, Array.from(merged.values()), distanceWindow);
           }
           if (destPool.length === 0) {
-            continue;
+            const fallback = rankPlacesByTargetDistance(origin, globalDestinationPool, distanceWindow.targetKm).slice(0, 20);
+            if (fallback.length === 0) continue;
+            destPool = fallback;
           }
           const uniqByPlace = new Map<string, KakaoPlace>();
           for (const place of destPool) {
@@ -1171,15 +1204,22 @@ export default function App() {
           destPool = await fetchDestinationPool(origin, pickedTransport.key, distanceWindow);
         }
         if (destPool.length === 0) {
+          destPool = rankPlacesByTargetDistance(origin, globalDestinationPool, distanceWindow.targetKm).slice(0, 30);
+        }
+        if (destPool.length === 0) {
+          const emergency = await collectKeywordPlaces(DEFAULT_DESTINATION_KEYWORDS, {
+            lat: origin.lat,
+            lng: origin.lng,
+            radiusMeters: 20000,
+            pages: 1,
+            sort: "distance",
+          });
+          destPool = emergency;
+        }
+        if (destPool.length === 0) {
           throw new Error("no_live_destination_found");
         }
-        const ranked = destPool
-          .sort((a, b) => {
-            const aKm = haversine(origin.lat, origin.lng, a.lat, a.lng);
-            const bKm = haversine(origin.lat, origin.lng, b.lat, b.lng);
-            return Math.abs(aKm - distanceWindow.targetKm) - Math.abs(bKm - distanceWindow.targetKm);
-          })
-          .slice(0, 18);
+        const ranked = rankPlacesByTargetDistance(origin, destPool, distanceWindow.targetKm).slice(0, 18);
         const pickedPlace = pick(ranked.slice(0, Math.min(6, ranked.length)));
         const destination = toDestination(pickedPlace, pickedTransport.label);
         const directKm = haversine(origin.lat, origin.lng, destination.lat, destination.lng);
