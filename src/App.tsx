@@ -136,8 +136,17 @@ function getDistanceWindowKm(transportKey: string, duration: string): { minKm: n
 }
 
 function getLastMileLimitKm(transportKey: string): number {
-  const speed = TRANSPORT_SPEED_KMH[transportKey] ?? 50;
-  return Math.max(3, Math.min(45, speed * 0.3));
+  const limits: Record<string, number> = {
+    plane: 140,
+    boat: 40,
+    ktx: 35,
+    rail: 28,
+    subway: 10,
+    bus: 12,
+    expressBus: 30,
+    intercityBus: 24,
+  };
+  return limits[transportKey] ?? 20;
 }
 
 function placeKeyOf(place: { name: string; lat: number; lng: number }): string {
@@ -531,6 +540,68 @@ function rankPlacesByTargetDistance(
   });
 }
 
+function isUrbanTransit(transportKey: string): boolean {
+  return transportKey === "subway" || transportKey === "bus";
+}
+
+async function searchRealtimeTransitHubs(
+  center: { lat: number; lng: number },
+  transportKey: string,
+  opts?: { radiusMeters?: number; limit?: number }
+): Promise<TransportHub[]> {
+  if (!isUrbanTransit(transportKey)) return [];
+  const kakao = await loadKakaoMapsSdk();
+  const places = new kakao.maps.services.Places();
+  const radius = Math.min(20000, Math.max(1000, opts?.radiusMeters ?? 12000));
+  const limit = Math.max(1, Math.min(20, opts?.limit ?? 10));
+  const keywords = transportKey === "subway"
+    ? ["지하철역", "전철역"]
+    : ["버스정류장", "환승센터"];
+
+  const runKeywordSearch = (keyword: string): Promise<any[]> =>
+    new Promise((resolve, reject) => {
+      places.keywordSearch(
+        keyword,
+        (data: any[], status: string) => {
+          if (status === kakao.maps.services.Status.OK) resolve(data ?? []);
+          else if (status === kakao.maps.services.Status.ZERO_RESULT) resolve([]);
+          else reject(new Error(`kakao_keyword_search_${status}`));
+        },
+        {
+          location: new kakao.maps.LatLng(center.lat, center.lng),
+          radius,
+          sort: kakao.maps.services.SortBy.DISTANCE,
+          size: 15,
+        }
+      );
+    });
+
+  const settled = await Promise.allSettled(keywords.map((keyword) => runKeywordSearch(keyword)));
+  const rows = settled
+    .filter((result): result is PromiseFulfilledResult<any[]> => result.status === "fulfilled")
+    .flatMap((result) => result.value);
+  const uniq = new Map<string, TransportHub>();
+  for (const row of rows) {
+    const lat = Number(row.y);
+    const lng = Number(row.x);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    const name = String(row.place_name ?? "").trim();
+    if (!name) continue;
+    const key = `${name}__${lat.toFixed(5)}__${lng.toFixed(5)}`;
+    if (!uniq.has(key)) {
+      uniq.set(key, {
+        name,
+        lat,
+        lng,
+        types: [transportKey === "subway" ? "train" : "bus"],
+        address: row.road_address_name || row.address_name || "",
+        placeUrl: row.place_url,
+      });
+    }
+  }
+  return Array.from(uniq.values()).slice(0, limit);
+}
+
 function getPlanErrorMessage(err: unknown): string {
   const code = err instanceof Error ? err.message : String(err ?? "unknown");
   if (code.includes("missing_kakao_rest_api_key")) {
@@ -548,13 +619,18 @@ function getPlanErrorMessage(err: unknown): string {
   return "실시간 검색 기반 계획 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.";
 }
 
-function findBestArrivalHub(
+async function findBestArrivalHub(
   destination: { lat: number; lng: number },
   transportKey: string
-): { hub: TransportHub; lastMileKm: number } | null {
+): Promise<{ hub: TransportHub; lastMileKm: number } | null> {
   const maxLastMile = getLastMileLimitKm(transportKey);
-  const candidates = TRANSPORT_HUBS
-    .filter((h) => hubMatchesTransport(h, transportKey))
+  const liveHubs = isUrbanTransit(transportKey)
+    ? await searchRealtimeTransitHubs(destination, transportKey, { radiusMeters: Math.round(maxLastMile * 1000), limit: 12 })
+    : [];
+  const sourceHubs = liveHubs.length > 0
+    ? liveHubs
+    : TRANSPORT_HUBS.filter((h) => hubMatchesTransport(h, transportKey));
+  const candidates = sourceHubs
     .map((hub) => ({
       hub,
       lastMileKm: haversine(destination.lat, destination.lng, hub.lat, hub.lng),
@@ -1095,7 +1171,12 @@ export default function App() {
     let hub: TransportHub | null = null;
     let selectedRoute: { destination: Destination; arrivalHub: TransportHub | null; routeKm: number } | null = null;
     if (isPublic) {
-      const originHubs = TRANSPORT_HUBS.filter((h) => hubMatchesTransport(h, pickedTransport.key));
+      const realtimeUrbanHubs = isUrbanTransit(pickedTransport.key)
+        ? await searchRealtimeTransitHubs(center, pickedTransport.key, { radiusMeters: 12000, limit: 14 })
+        : [];
+      const originHubs = realtimeUrbanHubs.length > 0
+        ? realtimeUrbanHubs
+        : TRANSPORT_HUBS.filter((h) => hubMatchesTransport(h, pickedTransport.key));
       const scoredPlans: Array<{
         score: number;
         originHub: TransportHub;
@@ -1130,7 +1211,10 @@ export default function App() {
       }
 
       if (scoredPlans.length > 0) {
-        const best = [...scoredPlans].sort((a, b) => a.score - b.score)[0];
+        const ranked = [...scoredPlans].sort((a, b) => a.score - b.score);
+        const pickTopN = pickedTransport.key === "plane" ? 8 : 4;
+        const finalists = ranked.slice(0, Math.min(pickTopN, ranked.length));
+        const best = pick(finalists);
         hub = best.originHub;
         selectedRoute = {
           destination: best.destination,
