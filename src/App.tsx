@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { REGIONS, type Region, type District, type Destination } from "./data/korea";
+import { REGIONS, DESTINATIONS, type Region, type District, type Destination } from "./data/korea";
 import {
-  haversine, centroid,
+  haversine, centroid, filterByTransport, findNearest,
   formatDistance, estimateTime, bearing, pick,
+  TRANSPORT_HUBS, hubMatchesTransport,
 } from "./utils/geo";
 import { loadKakaoMapsSdk } from "./utils/kakao";
 
@@ -547,31 +548,16 @@ function getPlanErrorMessage(err: unknown): string {
   return "실시간 검색 기반 계획 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.";
 }
 
-async function findBestArrivalHub(
+function findBestArrivalHub(
   destination: { lat: number; lng: number },
   transportKey: string
-): Promise<{ hub: TransportHub; lastMileKm: number } | null> {
-  const config = TRANSPORT_SEARCH_CONFIG[transportKey];
-  if (!config || config.hubKeywords.length === 0) return null;
+): { hub: TransportHub; lastMileKm: number } | null {
   const maxLastMile = getLastMileLimitKm(transportKey);
-  const places = await collectKeywordPlaces(config.hubKeywords, {
-    lat: destination.lat,
-    lng: destination.lng,
-    radiusMeters: Math.round(maxLastMile * 1000),
-    pages: 1,
-    sort: "distance",
-  });
-  const candidates = places
-    .map((place) => ({
-      hub: {
-        name: place.name,
-        lat: place.lat,
-        lng: place.lng,
-        types: [transportKey],
-        address: place.roadAddress || place.address,
-        placeUrl: place.placeUrl,
-      },
-      lastMileKm: haversine(destination.lat, destination.lng, place.lat, place.lng),
+  const candidates = TRANSPORT_HUBS
+    .filter((h) => hubMatchesTransport(h, transportKey))
+    .map((hub) => ({
+      hub,
+      lastMileKm: haversine(destination.lat, destination.lng, hub.lat, hub.lng),
     }))
     .filter((item) => item.lastMileKm <= maxLastMile)
     .sort((a, b) => a.lastMileKm - b.lastMileKm);
@@ -1104,167 +1090,90 @@ export default function App() {
 
     // 2) 참가자 중심점
     const center = centroid(allParticipantCoords);
-    const distanceWindow = getDistanceWindowKm(pickedTransport.key, settings.duration);
 
     // 3) 집합장소 + 목적지 전역 최적화
     let hub: TransportHub | null = null;
     let selectedRoute: { destination: Destination; arrivalHub: TransportHub | null; routeKm: number } | null = null;
-    try {
-      const globalDestinationPool = await fetchDestinationUniverse(center, pickedTransport.key);
+    if (isPublic) {
+      const originHubs = TRANSPORT_HUBS.filter((h) => hubMatchesTransport(h, pickedTransport.key));
+      const scoredPlans: Array<{
+        score: number;
+        originHub: TransportHub;
+        arrivalHub: TransportHub;
+        destination: Destination;
+        routeKm: number;
+      }> = [];
 
-      if (isPublic) {
-        const fetchedHubs = await fetchOriginHubs(center, pickedTransport.key);
-        const candidateHubs = fetchedHubs.slice(0, 4);
-        const scoredPlans: Array<{
-          score: number;
-          originHub: TransportHub | null;
-          destination: Destination;
-          routeKm: number;
-        }> = [];
+      for (const originHub of originHubs) {
+        const accessDists = allParticipantCoords.map((p) => haversine(p.lat, p.lng, originHub.lat, originHub.lng));
+        const accessSum = accessDists.reduce((sum, d) => sum + d, 0);
+        const accessMax = Math.max(...accessDists);
+        const accessMin = Math.min(...accessDists);
+        const accessGap = accessMax - accessMin;
 
-        for (const originHub of candidateHubs) {
-          const origin = { lat: originHub.lat, lng: originHub.lng };
-          const accessDists = allParticipantCoords.length > 0
-            ? allParticipantCoords.map((p) => haversine(p.lat, p.lng, origin.lat, origin.lng))
-            : [haversine(center.lat, center.lng, origin.lat, origin.lng)];
-          const accessSum = accessDists.reduce((sum, d) => sum + d, 0);
-          const accessMax = Math.max(...accessDists);
-          const accessMin = Math.min(...accessDists);
-          const accessGap = accessMax - accessMin;
+        const reachable = filterByTransport({ lat: originHub.lat, lng: originHub.lng }, DESTINATIONS, pickedTransport.key) as Destination[];
+        for (const d of reachable) {
+          const arrival = await findBestArrivalHub(d, pickedTransport.key);
+          if (!arrival) continue;
+          const trunkKm = haversine(originHub.lat, originHub.lng, arrival.hub.lat, arrival.hub.lng);
+          const totalRouteKm = trunkKm + arrival.lastMileKm;
 
-          const config = TRANSPORT_SEARCH_CONFIG[pickedTransport.key];
-          let destPool = filterByDistanceWindow(origin, globalDestinationPool, distanceWindow);
-          if (destPool.length < 8 && config) {
-            const nearbyExtra = await collectKeywordPlaces(config.destinationKeywords, {
-              lat: origin.lat,
-              lng: origin.lng,
-              radiusMeters: 20000,
-              pages: 1,
-              sort: "distance",
-            });
-            const merged = new Map<string, KakaoPlace>();
-            for (const place of [...destPool, ...nearbyExtra]) {
-              const key = placeKeyOf(place);
-              if (!merged.has(key)) merged.set(key, place);
-            }
-            destPool = filterByDistanceWindow(origin, Array.from(merged.values()), distanceWindow);
-          }
-          if (destPool.length === 0) {
-            const fallback = rankPlacesByTargetDistance(origin, globalDestinationPool, distanceWindow.targetKm).slice(0, 20);
-            if (fallback.length === 0) continue;
-            destPool = fallback;
-          }
-          const uniqByPlace = new Map<string, KakaoPlace>();
-          for (const place of destPool) {
-            const key = placeKeyOf(place);
-            if (!uniqByPlace.has(key)) uniqByPlace.set(key, place);
-          }
-          const shortlisted = Array.from(uniqByPlace.values())
-            .sort((a, b) => {
-              const aKm = haversine(origin.lat, origin.lng, a.lat, a.lng);
-              const bKm = haversine(origin.lat, origin.lng, b.lat, b.lng);
-              return Math.abs(aKm - distanceWindow.targetKm) - Math.abs(bKm - distanceWindow.targetKm);
-            })
-            .slice(0, 14);
-
-          for (const place of shortlisted) {
-            const routeKm = haversine(origin.lat, origin.lng, place.lat, place.lng);
-            const distancePenalty = Math.abs(routeKm - distanceWindow.targetKm);
-            const score = accessSum * 1.15 + accessMax * 0.85 + accessGap * 0.45 + routeKm * 0.5 + distancePenalty * 0.65;
-            scoredPlans.push({
-              score,
-              originHub,
-              destination: toDestination(place, pickedTransport.label),
-              routeKm,
-            });
-          }
-        }
-
-        if (scoredPlans.length > 0) {
-          const best = [...scoredPlans].sort((a, b) => a.score - b.score)[0];
-          hub = best.originHub;
-          selectedRoute = {
-            destination: best.destination,
-            arrivalHub: null,
-            routeKm: best.routeKm,
-          };
-          const arrival = await findBestArrivalHub(best.destination, pickedTransport.key);
-          if (arrival) {
-            selectedRoute.arrivalHub = arrival.hub;
-            selectedRoute.routeKm += arrival.lastMileKm;
-          }
+          const score = accessSum * 1.15 + accessMax * 0.85 + accessGap * 0.45 + totalRouteKm * 0.75;
+          scoredPlans.push({
+            score,
+            originHub,
+            arrivalHub: arrival.hub,
+            destination: d,
+            routeKm: totalRouteKm,
+          });
         }
       }
 
-      const origin = hub ? { lat: hub.lat, lng: hub.lng } : center;
-
-      if (!selectedRoute) {
-        let destPool = filterByDistanceWindow(origin, globalDestinationPool, distanceWindow);
-        if (destPool.length < 10) {
-          destPool = await fetchDestinationPool(origin, pickedTransport.key, distanceWindow);
-        }
-        if (destPool.length === 0) {
-          destPool = rankPlacesByTargetDistance(origin, globalDestinationPool, distanceWindow.targetKm).slice(0, 30);
-        }
-        if (destPool.length === 0) {
-          const emergency = await collectKeywordPlaces(DEFAULT_DESTINATION_KEYWORDS, {
-            lat: origin.lat,
-            lng: origin.lng,
-            radiusMeters: 20000,
-            pages: 1,
-            sort: "distance",
-          });
-          destPool = emergency;
-        }
-        if (destPool.length === 0) {
-          throw new Error("no_live_destination_found");
-        }
-        const ranked = rankPlacesByTargetDistance(origin, destPool, distanceWindow.targetKm).slice(0, 18);
-        const pickedPlace = pick(ranked.slice(0, Math.min(6, ranked.length)));
-        const destination = toDestination(pickedPlace, pickedTransport.label);
-        const directKm = haversine(origin.lat, origin.lng, destination.lat, destination.lng);
-        let arrivalHub: TransportHub | null = null;
-        let totalKm = directKm;
-        if (isPublic) {
-          const arrival = await findBestArrivalHub(destination, pickedTransport.key);
-          if (arrival) {
-            arrivalHub = arrival.hub;
-            totalKm += arrival.lastMileKm;
-          }
-        }
+      if (scoredPlans.length > 0) {
+        const best = [...scoredPlans].sort((a, b) => a.score - b.score)[0];
+        hub = best.originHub;
         selectedRoute = {
-          destination,
-          arrivalHub,
-          routeKm: totalKm,
+          destination: best.destination,
+          arrivalHub: best.arrivalHub,
+          routeKm: best.routeKm,
         };
       }
-
-      const distFromCenter = haversine(center.lat, center.lng, selectedRoute.destination.lat, selectedRoute.destination.lng);
-      const estTime = estimateTime(selectedRoute.routeKm, pickedTransport.key);
-
-      const tips = [
-        "미리 간식 챙겨가세요 🍫", "날씨 앱 꼭 확인!", "보조배터리 필수 🔋",
-        "편한 신발 추천 👟", "현금도 조금 챙기세요 💰", "사진 많이 찍어요 📸",
-        "시간표는 아래 검색 버튼으로 바로 확인 가능해요 🕒", "현지 맛집 검색은 필수 🔍",
-      ];
-
-      setPlan({
-        transport: pickedTransport,
-        hub,
-        arrivalHub: selectedRoute.arrivalHub,
-        destination: selectedRoute.destination,
-        distFromHub: selectedRoute.routeKm,
-        distFromCentroid: distFromCenter,
-        departTime: settings.time,
-        estimatedTime: estTime,
-        tip: pick(tips),
-      });
-      setStep("plan_result");
-    } catch (err) {
-      console.error(err);
-      setStep("settings");
-      window.alert(getPlanErrorMessage(err));
     }
+
+    const origin = hub ? { lat: hub.lat, lng: hub.lng } : center;
+
+    if (!selectedRoute) {
+      const validDests = filterByTransport(origin, DESTINATIONS, pickedTransport.key) as Destination[];
+      const fallbackPool = validDests.length > 0 ? validDests : (findNearest(origin, DESTINATIONS).slice(0, 12) as Destination[]);
+      const destination = pick(fallbackPool);
+      selectedRoute = {
+        destination,
+        arrivalHub: isPublic ? (await findBestArrivalHub(destination, pickedTransport.key))?.hub ?? null : null,
+        routeKm: haversine(origin.lat, origin.lng, destination.lat, destination.lng),
+      };
+    }
+
+    const distFromCenter = haversine(center.lat, center.lng, selectedRoute.destination.lat, selectedRoute.destination.lng);
+    const estTime = estimateTime(selectedRoute.routeKm, pickedTransport.key);
+
+    const tips = [
+      "미리 간식 챙겨가세요 🍫", "날씨 앱 꼭 확인!", "보조배터리 필수 🔋",
+      "편한 신발 추천 👟", "현금도 조금 챙기세요 💰", "사진 많이 찍어요 📸",
+      "시간표는 아래 검색 버튼으로 바로 확인 가능해요 🕒", "현지 맛집 검색은 필수 🔍",
+    ];
+
+    setPlan({
+      transport: pickedTransport,
+      hub,
+      arrivalHub: selectedRoute.arrivalHub,
+      destination: selectedRoute.destination,
+      distFromHub: selectedRoute.routeKm,
+      distFromCentroid: distFromCenter,
+      departTime: settings.time,
+      estimatedTime: estTime,
+      tip: pick(tips),
+    });
+    setStep("plan_result");
   };
 
   // ── GPS 기반 랜덤 스핀 ──

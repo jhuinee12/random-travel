@@ -30,6 +30,7 @@ export const TRANSPORT_RADIUS: Record<string, number> = {
   boat: 400,
   ktx: 420,
   rail: 280,
+  subway: 120,
   expressBus: 300,
   intercityBus: 220,
   train: 350,
@@ -45,6 +46,7 @@ export const TRANSPORT_MIN: Record<string, number> = {
   boat: 30,
   ktx: 80,
   rail: 40,
+  subway: 2,
   expressBus: 60,
   intercityBus: 30,
   train: 50,
@@ -124,6 +126,8 @@ export function hubMatchesTransport(hub: TransportHub, transportKey: string): bo
     case "ktx":
       return hasType("train") && (KTX_CORE_HUBS.has(hub.name) || hub.name.includes("KTX"));
     case "rail":
+      return hasType("train");
+    case "subway":
       return hasType("train");
     case "expressBus":
       return hasType("bus") && isExpressBusHub(hub.name);
