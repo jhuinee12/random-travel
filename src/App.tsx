@@ -388,7 +388,7 @@ export default function App() {
     cat: string,
     lat: number,
     lng: number,
-    opts?: { query?: string; categoryCode?: string }
+    opts?: { query?: string; categoryCode?: string; radiusMeters?: number }
   ): Promise<SpinCandidate[]> => {
     type OverpassElement = {
       type: "node" | "way" | "relation";
@@ -400,7 +400,10 @@ export default function App() {
     };
     type OverpassResp = { elements?: OverpassElement[] };
 
-    const radiusMeters = Math.min(20000, Math.max(500, Math.round((CATEGORY_META[cat]?.radius ?? 2) * 1000)));
+    const radiusMeters = Math.min(
+      20000,
+      Math.max(500, opts?.radiusMeters ?? Math.round((CATEGORY_META[cat]?.radius ?? 2) * 1000))
+    );
     const menuCuisineMap: Record<string, string> = {
       "국밥": "korean",
       "칼국수": "noodle",
@@ -503,6 +506,25 @@ out center 60;`;
       .sort((a, b) => (b.popularity ?? 0) - (a.popularity ?? 0) || (a.distanceKm ?? 999) - (b.distanceKm ?? 999))
       .slice(0, 10);
   }, []);
+
+  const buildFoodCafePool = useCallback(async (
+    cat: "food" | "cafe",
+    lat: number,
+    lng: number,
+    keyword: string
+  ): Promise<SpinCandidate[]> => {
+    const merged = new Map<string, SpinCandidate>();
+    const byKeyword = await fetchNearbyCandidates(cat, lat, lng, { query: keyword });
+    const byCategory = await fetchNearbyCandidates(cat, lat, lng);
+    for (const c of [...byKeyword, ...byCategory]) {
+      const key = `${c.name}__${c.address ?? ""}`;
+      if (!merged.has(key)) merged.set(key, c);
+    }
+
+    return Array.from(merged.values())
+      .sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999))
+      .slice(0, 50);
+  }, [fetchNearbyCandidates]);
 
   const buildPlanShareText = (p: PlanResult) => {
     const lines = [
@@ -678,47 +700,25 @@ out center 60;`;
         if (cat === "food") {
           const menu = pick(FOOD_MENUS);
           subLabel = `오늘 메뉴: ${menu}`;
-          const byMenu = await fetchNearbyCandidates(cat, gps.lat, gps.lng, { query: menu });
-          const byCategory = byMenu.length < 5 ? await fetchNearbyCandidates(cat, gps.lat, gps.lng) : [];
-          const merged = [...byMenu, ...byCategory];
-          const uniq = new Map<string, SpinCandidate>();
-          for (const c of merged) {
-            const key = `${c.name}__${c.address ?? ""}`;
-            if (!uniq.has(key)) uniq.set(key, c);
-          }
-          const nearby = Array.from(uniq.values());
-          if (nearby.length >= 3) {
-            const pool50 = nearby
-              .sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999))
-              .slice(0, 50);
-            candidates = pickN(pool50, Math.min(5, pool50.length));
+          const pool50 = await buildFoodCafePool("food", gps.lat, gps.lng, menu);
+          if (pool50.length > 0) {
+            candidates = pool50;
             source = "real";
-            subLabel = `오늘 메뉴: ${menu} · 주변 ${Math.min(50, pool50.length)}곳 중 랜덤`;
+            subLabel = `오늘 메뉴: ${menu} · 주변 ${pool50.length}곳 중 랜덤`;
           }
         } else if (cat === "cafe") {
           const theme = pick(CAFE_THEMES);
           subLabel = `카페 취향: ${theme}`;
-          const byTheme = await fetchNearbyCandidates(cat, gps.lat, gps.lng, { query: theme });
-          const byCategory = byTheme.length < 5 ? await fetchNearbyCandidates(cat, gps.lat, gps.lng) : [];
-          const merged = [...byTheme, ...byCategory];
-          const uniq = new Map<string, SpinCandidate>();
-          for (const c of merged) {
-            const key = `${c.name}__${c.address ?? ""}`;
-            if (!uniq.has(key)) uniq.set(key, c);
-          }
-          const nearby = Array.from(uniq.values());
-          if (nearby.length >= 3) {
-            const pool50 = nearby
-              .sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999))
-              .slice(0, 50);
-            candidates = pickN(pool50, Math.min(5, pool50.length));
+          const pool50 = await buildFoodCafePool("cafe", gps.lat, gps.lng, theme);
+          if (pool50.length > 0) {
+            candidates = pool50;
             source = "real";
-            subLabel = `카페 취향: ${theme} · 주변 ${Math.min(50, pool50.length)}곳 중 랜덤`;
+            subLabel = `카페 취향: ${theme} · 주변 ${pool50.length}곳 중 랜덤`;
           }
         } else {
           const nearby = await fetchNearbyCandidates(cat, gps.lat, gps.lng);
-          if (nearby.length >= 3) {
-            candidates = pickN(nearby, Math.min(5, nearby.length));
+          if (nearby.length > 0) {
+            candidates = nearby;
             source = "real";
             subLabel = `인기 상위 ${Math.min(10, nearby.length)}곳 중 랜덤`;
           }
