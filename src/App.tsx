@@ -1,9 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { REGIONS, DESTINATIONS, type Region, type District, type Destination } from "./data/korea";
+import { REGIONS, type Region, type District, type Destination } from "./data/korea";
 import {
-  haversine, centroid, filterByTransport, findNearest,
+  haversine, centroid,
   formatDistance, estimateTime, bearing, pick,
-  TRANSPORT_HUBS, hubMatchesTransport, type TransportHub,
 } from "./utils/geo";
 import { loadKakaoMapsSdk } from "./utils/kakao";
 
@@ -13,12 +12,212 @@ const TRANSPORTS = [
   { key: "boat", label: "배", emoji: "🚢", type: "public" },
   { key: "ktx", label: "KTX", emoji: "🚄", type: "public" },
   { key: "rail", label: "일반열차", emoji: "🚂", type: "public" },
+  { key: "subway", label: "지하철", emoji: "🚇", type: "public" },
+  { key: "bus", label: "버스", emoji: "🚌", type: "public" },
   { key: "expressBus", label: "고속버스", emoji: "🚌", type: "public" },
   { key: "intercityBus", label: "시외버스", emoji: "🚍", type: "public" },
   { key: "car", label: "자가용", emoji: "🚗", type: "private" },
   { key: "bicycle", label: "자전거", emoji: "🚲", type: "private" },
   { key: "walk", label: "걷기", emoji: "🚶", type: "private" },
 ];
+
+interface TransportHub {
+  name: string;
+  lat: number;
+  lng: number;
+  types: string[];
+  address?: string;
+  placeUrl?: string;
+}
+
+type KakaoPlace = {
+  name: string;
+  lat: number;
+  lng: number;
+  address: string;
+  roadAddress: string;
+  categoryName: string;
+  placeUrl?: string;
+};
+
+type TransportSearchConfig = {
+  hubKeywords: string[];
+  destinationKeywords: string[];
+  hubCategoryCode?: string;
+};
+
+const TRANSPORT_SPEED_KMH: Record<string, number> = {
+  plane: 500,
+  boat: 30,
+  ktx: 210,
+  rail: 110,
+  subway: 40,
+  bus: 30,
+  expressBus: 85,
+  intercityBus: 70,
+  car: 80,
+  bicycle: 15,
+  walk: 4,
+};
+
+const TRANSPORT_SEARCH_CONFIG: Record<string, TransportSearchConfig> = {
+  plane: {
+    hubKeywords: ["공항", "국제공항"],
+    destinationKeywords: ["관광지", "명소", "해변", "국립공원", "테마파크"],
+  },
+  boat: {
+    hubKeywords: ["여객터미널", "항", "항만"],
+    destinationKeywords: ["섬 관광지", "해변", "항구 관광지", "바다 전망대"],
+  },
+  ktx: {
+    hubKeywords: ["KTX역", "기차역"],
+    destinationKeywords: ["관광지", "명소", "박물관", "자연휴양림", "전통시장"],
+  },
+  rail: {
+    hubKeywords: ["기차역", "역"],
+    destinationKeywords: ["관광지", "명소", "박물관", "공원", "전망대"],
+  },
+  subway: {
+    hubKeywords: ["지하철역", "전철역", "역"],
+    destinationKeywords: ["핫플", "전시관", "공원", "맛집거리", "카페거리"],
+  },
+  bus: {
+    hubKeywords: ["버스환승센터", "버스정류장", "버스터미널"],
+    destinationKeywords: ["관광지", "핫플", "시장", "공원", "전시관"],
+  },
+  expressBus: {
+    hubKeywords: ["고속버스터미널"],
+    destinationKeywords: ["관광지", "명소", "시장", "공원", "테마파크"],
+  },
+  intercityBus: {
+    hubKeywords: ["시외버스터미널", "버스터미널"],
+    destinationKeywords: ["관광지", "명소", "시장", "공원", "전망대"],
+  },
+  car: {
+    hubKeywords: [],
+    destinationKeywords: ["드라이브 코스", "관광지", "명소", "휴양림", "호수공원"],
+  },
+  bicycle: {
+    hubKeywords: [],
+    destinationKeywords: ["자전거길", "강변", "공원", "카페거리", "산책로"],
+  },
+  walk: {
+    hubKeywords: [],
+    destinationKeywords: ["산책로", "공원", "카페거리", "전시관", "야경 명소"],
+  },
+};
+
+function getDurationHours(duration: string): number {
+  if (duration === "2박 3일") return 30;
+  if (duration === "1박 2일") return 16;
+  return 8;
+}
+
+function getDistanceWindowKm(transportKey: string, duration: string): { minKm: number; maxKm: number; targetKm: number } {
+  const speed = TRANSPORT_SPEED_KMH[transportKey] ?? 60;
+  const hours = getDurationHours(duration);
+  const transportType = TRANSPORTS.find((t) => t.key === transportKey)?.type ?? "private";
+  const hardCaps: Record<string, number> = {
+    walk: 24,
+    bicycle: 120,
+    subway: 180,
+    bus: 140,
+  };
+  const hardCap = hardCaps[transportKey] ?? 900;
+  const maxKm = Math.max(2, Math.min(hardCap, speed * hours));
+  const minRatio = transportType === "public" ? 0.22 : 0.08;
+  const minFloor = transportType === "public" ? 12 : 0.5;
+  const minKm = Math.min(maxKm * 0.85, Math.max(minFloor, maxKm * minRatio));
+  return { minKm, maxKm, targetKm: (minKm + maxKm) / 2 };
+}
+
+function getLastMileLimitKm(transportKey: string): number {
+  const speed = TRANSPORT_SPEED_KMH[transportKey] ?? 50;
+  return Math.max(3, Math.min(45, speed * 0.3));
+}
+
+function placeKeyOf(place: { name: string; lat: number; lng: number }): string {
+  return `${place.name}__${place.lat.toFixed(5)}__${place.lng.toFixed(5)}`;
+}
+
+function parseRegion(address: string): string {
+  const token = address.trim().split(/\s+/)[0];
+  return token || "위치 기반";
+}
+
+function toDestination(place: KakaoPlace, transportLabel: string): Destination {
+  const address = place.roadAddress || place.address || "";
+  const region = parseRegion(address);
+  const categoryToken = place.categoryName ? place.categoryName.split(">").pop()?.trim() : "";
+  const tags = [transportLabel, categoryToken || "실시간 검색", region].filter(Boolean);
+  return {
+    name: place.name,
+    lat: place.lat,
+    lng: place.lng,
+    region,
+    description: address ? `${address} 기반 추천 목적지` : "실시간 검색 기반 추천 목적지",
+    tags: tags.slice(0, 3),
+  };
+}
+
+function getKakaoRestApiKey(): string {
+  const key = import.meta.env.VITE_KAKAO_REST_API_KEY?.trim();
+  if (!key) throw new Error("missing_kakao_rest_api_key");
+  return key;
+}
+
+async function searchKakaoKeyword(query: string, opts?: {
+  lat?: number;
+  lng?: number;
+  radiusMeters?: number;
+  page?: number;
+  size?: number;
+  sort?: "accuracy" | "distance";
+  categoryGroupCode?: string;
+}): Promise<KakaoPlace[]> {
+  const key = getKakaoRestApiKey();
+  const params = new URLSearchParams({
+    query,
+    page: String(opts?.page ?? 1),
+    size: String(opts?.size ?? 15),
+    sort: opts?.sort ?? "accuracy",
+  });
+  if (opts?.lat !== undefined && opts?.lng !== undefined) {
+    params.set("x", String(opts.lng));
+    params.set("y", String(opts.lat));
+  }
+  if (opts?.radiusMeters !== undefined) {
+    params.set("radius", String(Math.max(500, Math.min(20000, Math.round(opts.radiusMeters)))));
+  }
+  if (opts?.categoryGroupCode) {
+    params.set("category_group_code", opts.categoryGroupCode);
+  }
+
+  const res = await fetch(`https://dapi.kakao.com/v2/local/search/keyword.json?${params.toString()}`, {
+    headers: { Authorization: `KakaoAK ${key}` },
+  });
+  if (!res.ok) {
+    throw new Error(`kakao_rest_${res.status}`);
+  }
+  const data = await res.json() as { documents?: any[] };
+  const docs = data.documents ?? [];
+  return docs
+    .map((doc) => {
+      const lat = Number(doc.y);
+      const lng = Number(doc.x);
+      if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+      return {
+        name: String(doc.place_name ?? ""),
+        lat,
+        lng,
+        address: String(doc.address_name ?? ""),
+        roadAddress: String(doc.road_address_name ?? ""),
+        categoryName: String(doc.category_name ?? ""),
+        placeUrl: typeof doc.place_url === "string" ? doc.place_url : undefined,
+      } as KakaoPlace;
+    })
+    .filter((item): item is KakaoPlace => item !== null && item.name.length > 0);
+}
 
 // ── SPIN (여행지 현장) CATEGORIES ──
 const CATEGORY_META: Record<string, { label: string; emoji: string; radius: number; color: string; bg: string }> = {
@@ -172,32 +371,126 @@ function getRadiusMaxKm(cat: string): number {
   return 20;
 }
 
-function getLastMileLimit(transportKey: string): number {
-  const map: Record<string, number> = {
-    plane: 40,
-    boat: 20,
-    ktx: 25,
-    rail: 20,
-    expressBus: 18,
-    intercityBus: 15,
-  };
-  return map[transportKey] ?? 20;
+async function collectKeywordPlaces(
+  keywords: string[],
+  opts: {
+    lat?: number;
+    lng?: number;
+    radiusMeters?: number;
+    categoryGroupCode?: string;
+    pages?: number;
+    sort?: "accuracy" | "distance";
+  }
+): Promise<KakaoPlace[]> {
+  const pages = Math.max(1, opts.pages ?? 1);
+  const tasks: Array<Promise<KakaoPlace[]>> = [];
+  for (const keyword of keywords) {
+    for (let page = 1; page <= pages; page += 1) {
+      tasks.push(searchKakaoKeyword(keyword, {
+        lat: opts.lat,
+        lng: opts.lng,
+        radiusMeters: opts.radiusMeters,
+        categoryGroupCode: opts.categoryGroupCode,
+        page,
+        size: 15,
+        sort: opts.sort ?? "accuracy",
+      }));
+    }
+  }
+  const settled = await Promise.allSettled(tasks);
+  const merged = settled
+    .filter((result): result is PromiseFulfilledResult<KakaoPlace[]> => result.status === "fulfilled")
+    .flatMap((result) => result.value);
+  const uniq = new Map<string, KakaoPlace>();
+  for (const place of merged) {
+    const key = placeKeyOf(place);
+    if (!uniq.has(key)) uniq.set(key, place);
+  }
+  return Array.from(uniq.values());
 }
 
-function findBestArrivalHub(
-  destination: Destination,
+async function fetchOriginHubs(
+  center: { lat: number; lng: number },
   transportKey: string
-): { hub: TransportHub; lastMileKm: number } | null {
-  const maxLastMile = getLastMileLimit(transportKey);
-  const candidates = TRANSPORT_HUBS
-    .filter((h) => hubMatchesTransport(h, transportKey))
-    .map((hub) => ({
-      hub,
-      lastMileKm: haversine(hub.lat, hub.lng, destination.lat, destination.lng),
-    }))
-    .filter((x) => x.lastMileKm <= maxLastMile)
-    .sort((a, b) => a.lastMileKm - b.lastMileKm);
+): Promise<TransportHub[]> {
+  const config = TRANSPORT_SEARCH_CONFIG[transportKey];
+  if (!config || config.hubKeywords.length === 0) return [];
+  const places = await collectKeywordPlaces(config.hubKeywords, {
+    lat: center.lat,
+    lng: center.lng,
+    radiusMeters: 20000,
+    categoryGroupCode: config.hubCategoryCode,
+    pages: 2,
+    sort: "distance",
+  });
+  return places.slice(0, 20).map((place) => ({
+    name: place.name,
+    lat: place.lat,
+    lng: place.lng,
+    types: [transportKey],
+    address: place.roadAddress || place.address,
+    placeUrl: place.placeUrl,
+  }));
+}
 
+async function fetchDestinationPool(
+  origin: { lat: number; lng: number },
+  transportKey: string,
+  windowKm: { minKm: number; maxKm: number }
+): Promise<KakaoPlace[]> {
+  const config = TRANSPORT_SEARCH_CONFIG[transportKey];
+  if (!config) return [];
+  const nearby = await collectKeywordPlaces(config.destinationKeywords, {
+    lat: origin.lat,
+    lng: origin.lng,
+    radiusMeters: 20000,
+    pages: 2,
+    sort: "distance",
+  });
+  const nationwide = await collectKeywordPlaces(config.destinationKeywords, {
+    pages: 2,
+    sort: "accuracy",
+  });
+  return [...nearby, ...nationwide]
+    .filter((place) => {
+      const km = haversine(origin.lat, origin.lng, place.lat, place.lng);
+      return km >= windowKm.minKm && km <= windowKm.maxKm;
+    })
+    .sort((a, b) => {
+      const aKm = haversine(origin.lat, origin.lng, a.lat, a.lng);
+      const bKm = haversine(origin.lat, origin.lng, b.lat, b.lng);
+      return aKm - bKm;
+    });
+}
+
+async function findBestArrivalHub(
+  destination: { lat: number; lng: number },
+  transportKey: string
+): Promise<{ hub: TransportHub; lastMileKm: number } | null> {
+  const config = TRANSPORT_SEARCH_CONFIG[transportKey];
+  if (!config || config.hubKeywords.length === 0) return null;
+  const maxLastMile = getLastMileLimitKm(transportKey);
+  const places = await collectKeywordPlaces(config.hubKeywords, {
+    lat: destination.lat,
+    lng: destination.lng,
+    radiusMeters: Math.round(maxLastMile * 1000),
+    pages: 1,
+    sort: "distance",
+  });
+  const candidates = places
+    .map((place) => ({
+      hub: {
+        name: place.name,
+        lat: place.lat,
+        lng: place.lng,
+        types: [transportKey],
+        address: place.roadAddress || place.address,
+        placeUrl: place.placeUrl,
+      },
+      lastMileKm: haversine(destination.lat, destination.lng, place.lat, place.lng),
+    }))
+    .filter((item) => item.lastMileKm <= maxLastMile)
+    .sort((a, b) => a.lastMileKm - b.lastMileKm);
   return candidates[0] ?? null;
 }
 
@@ -718,98 +1011,144 @@ export default function App() {
 
     // 1) 랜덤 이동수단 선택
     const selectedTransports = TRANSPORTS.filter(t => settings.transports.includes(t.key));
+    if (selectedTransports.length === 0) {
+      setStep("settings");
+      return;
+    }
     const pickedTransport = pick(selectedTransports);
     const isPublic = pickedTransport.type === "public";
 
     // 2) 참가자 중심점
     const center = centroid(allParticipantCoords);
+    const distanceWindow = getDistanceWindowKm(pickedTransport.key, settings.duration);
 
     // 3) 집합장소 + 목적지 전역 최적화
     let hub: TransportHub | null = null;
     let selectedRoute: { destination: Destination; arrivalHub: TransportHub | null; routeKm: number } | null = null;
+    try {
+      if (isPublic) {
+        const fetchedHubs = await fetchOriginHubs(center, pickedTransport.key);
+        const candidateHubs = fetchedHubs.slice(0, 6);
+        const scoredPlans: Array<{
+          score: number;
+          originHub: TransportHub | null;
+          destination: Destination;
+          routeKm: number;
+        }> = [];
 
-    if (isPublic) {
-      const originHubs = TRANSPORT_HUBS.filter((h) => hubMatchesTransport(h, pickedTransport.key));
-      const scoredPlans: Array<{
-        score: number;
-        originHub: TransportHub;
-        arrivalHub: TransportHub;
-        destination: Destination;
-        routeKm: number;
-      }> = [];
+        for (const originHub of candidateHubs) {
+          const origin = { lat: originHub.lat, lng: originHub.lng };
+          const accessDists = allParticipantCoords.length > 0
+            ? allParticipantCoords.map((p) => haversine(p.lat, p.lng, origin.lat, origin.lng))
+            : [haversine(center.lat, center.lng, origin.lat, origin.lng)];
+          const accessSum = accessDists.reduce((sum, d) => sum + d, 0);
+          const accessMax = Math.max(...accessDists);
+          const accessMin = Math.min(...accessDists);
+          const accessGap = accessMax - accessMin;
 
-      for (const originHub of originHubs) {
-        const accessDists = allParticipantCoords.map((p) => haversine(p.lat, p.lng, originHub.lat, originHub.lng));
-        const accessSum = accessDists.reduce((sum, d) => sum + d, 0);
-        const accessMax = Math.max(...accessDists);
-        const accessMin = Math.min(...accessDists);
-        const accessGap = accessMax - accessMin;
+          const destPool = await fetchDestinationPool(origin, pickedTransport.key, distanceWindow);
+          if (destPool.length === 0) continue;
+          const uniqByPlace = new Map<string, KakaoPlace>();
+          for (const place of destPool) {
+            const key = placeKeyOf(place);
+            if (!uniqByPlace.has(key)) uniqByPlace.set(key, place);
+          }
+          const shortlisted = Array.from(uniqByPlace.values())
+            .sort((a, b) => {
+              const aKm = haversine(origin.lat, origin.lng, a.lat, a.lng);
+              const bKm = haversine(origin.lat, origin.lng, b.lat, b.lng);
+              return Math.abs(aKm - distanceWindow.targetKm) - Math.abs(bKm - distanceWindow.targetKm);
+            })
+            .slice(0, 14);
 
-        const reachable = filterByTransport({ lat: originHub.lat, lng: originHub.lng }, DESTINATIONS, pickedTransport.key) as Destination[];
-        for (const d of reachable) {
-          const arrival = findBestArrivalHub(d, pickedTransport.key);
-          if (!arrival) continue;
-          const trunkKm = haversine(originHub.lat, originHub.lng, arrival.hub.lat, arrival.hub.lng);
-          const totalRouteKm = trunkKm + arrival.lastMileKm;
+          for (const place of shortlisted) {
+            const routeKm = haversine(origin.lat, origin.lng, place.lat, place.lng);
+            const distancePenalty = Math.abs(routeKm - distanceWindow.targetKm);
+            const score = accessSum * 1.15 + accessMax * 0.85 + accessGap * 0.45 + routeKm * 0.5 + distancePenalty * 0.65;
+            scoredPlans.push({
+              score,
+              originHub,
+              destination: toDestination(place, pickedTransport.label),
+              routeKm,
+            });
+          }
+        }
 
-          // 참가자 접근성 + 이동거리 + 접근 형평성(최대-최소 거리)을 함께 최소화
-          const score = accessSum * 1.15 + accessMax * 0.85 + accessGap * 0.45 + totalRouteKm * 0.75;
-          scoredPlans.push({
-            score,
-            originHub,
-            arrivalHub: arrival.hub,
-            destination: d,
-            routeKm: totalRouteKm,
-          });
+        if (scoredPlans.length > 0) {
+          const best = [...scoredPlans].sort((a, b) => a.score - b.score)[0];
+          hub = best.originHub;
+          selectedRoute = {
+            destination: best.destination,
+            arrivalHub: null,
+            routeKm: best.routeKm,
+          };
+          const arrival = await findBestArrivalHub(best.destination, pickedTransport.key);
+          if (arrival) {
+            selectedRoute.arrivalHub = arrival.hub;
+            selectedRoute.routeKm += arrival.lastMileKm;
+          }
         }
       }
 
-      if (scoredPlans.length > 0) {
-        const best = [...scoredPlans].sort((a, b) => a.score - b.score)[0];
-        hub = best.originHub;
+      const origin = hub ? { lat: hub.lat, lng: hub.lng } : center;
+
+      if (!selectedRoute) {
+        const destPool = await fetchDestinationPool(origin, pickedTransport.key, distanceWindow);
+        if (destPool.length === 0) {
+          throw new Error("no_live_destination_found");
+        }
+        const ranked = destPool
+          .sort((a, b) => {
+            const aKm = haversine(origin.lat, origin.lng, a.lat, a.lng);
+            const bKm = haversine(origin.lat, origin.lng, b.lat, b.lng);
+            return Math.abs(aKm - distanceWindow.targetKm) - Math.abs(bKm - distanceWindow.targetKm);
+          })
+          .slice(0, 18);
+        const pickedPlace = pick(ranked.slice(0, Math.min(6, ranked.length)));
+        const destination = toDestination(pickedPlace, pickedTransport.label);
+        const directKm = haversine(origin.lat, origin.lng, destination.lat, destination.lng);
+        let arrivalHub: TransportHub | null = null;
+        let totalKm = directKm;
+        if (isPublic) {
+          const arrival = await findBestArrivalHub(destination, pickedTransport.key);
+          if (arrival) {
+            arrivalHub = arrival.hub;
+            totalKm += arrival.lastMileKm;
+          }
+        }
         selectedRoute = {
-          destination: best.destination,
-          arrivalHub: best.arrivalHub,
-          routeKm: best.routeKm,
+          destination,
+          arrivalHub,
+          routeKm: totalKm,
         };
       }
+
+      const distFromCenter = haversine(center.lat, center.lng, selectedRoute.destination.lat, selectedRoute.destination.lng);
+      const estTime = estimateTime(selectedRoute.routeKm, pickedTransport.key);
+
+      const tips = [
+        "미리 간식 챙겨가세요 🍫", "날씨 앱 꼭 확인!", "보조배터리 필수 🔋",
+        "편한 신발 추천 👟", "현금도 조금 챙기세요 💰", "사진 많이 찍어요 📸",
+        "시간표는 아래 검색 버튼으로 바로 확인 가능해요 🕒", "현지 맛집 검색은 필수 🔍",
+      ];
+
+      setPlan({
+        transport: pickedTransport,
+        hub,
+        arrivalHub: selectedRoute.arrivalHub,
+        destination: selectedRoute.destination,
+        distFromHub: selectedRoute.routeKm,
+        distFromCentroid: distFromCenter,
+        departTime: settings.time,
+        estimatedTime: estTime,
+        tip: pick(tips),
+      });
+      setStep("plan_result");
+    } catch (err) {
+      console.error(err);
+      setStep("settings");
+      window.alert("실시간 검색 기반 계획 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.");
     }
-
-    const origin = hub ? { lat: hub.lat, lng: hub.lng } : center;
-
-    if (!selectedRoute) {
-      // 개인 이동 혹은 대중교통 후보 부족 시: 중심점/허브 기준 fallback
-      const validDests = filterByTransport(origin, DESTINATIONS, pickedTransport.key) as Destination[];
-      const fallbackPool = validDests.length > 0 ? validDests : (findNearest(origin, DESTINATIONS).slice(0, 12) as Destination[]);
-      const destination = pick(fallbackPool);
-      selectedRoute = {
-        destination,
-        arrivalHub: isPublic ? findBestArrivalHub(destination, pickedTransport.key)?.hub ?? null : null,
-        routeKm: haversine(origin.lat, origin.lng, destination.lat, destination.lng),
-      };
-    }
-
-    const distFromCenter = haversine(center.lat, center.lng, selectedRoute.destination.lat, selectedRoute.destination.lng);
-    const estTime = estimateTime(selectedRoute.routeKm, pickedTransport.key);
-
-    const tips = [
-      "미리 간식 챙겨가세요 🍫", "날씨 앱 꼭 확인!", "보조배터리 필수 🔋",
-      "편한 신발 추천 👟", "현금도 조금 챙기세요 💰", "사진 많이 찍어요 📸",
-      "대중교통 시간표 미리 확인!", "현지 맛집 검색은 필수 🔍",
-    ];
-
-    setPlan({
-      transport: pickedTransport,
-      hub,
-      arrivalHub: selectedRoute.arrivalHub,
-      destination: selectedRoute.destination,
-      distFromHub: selectedRoute.routeKm,
-      distFromCentroid: distFromCenter,
-      departTime: settings.time,
-      estimatedTime: estTime,
-      tip: pick(tips),
-    });
-    setStep("plan_result");
   };
 
   // ── GPS 기반 랜덤 스핀 ──
@@ -1147,6 +1486,14 @@ export default function App() {
   if (step === "plan_result" && plan) {
     const isPublic = plan.transport.type === "public";
     const destTags = plan.destination.tags || [];
+    const scheduleQuery = [
+      plan.transport.label,
+      plan.hub?.name,
+      plan.arrivalHub?.name,
+      plan.destination.name,
+      "시간표",
+    ].filter(Boolean).join(" ");
+    const scheduleUrl = `https://search.naver.com/search.naver?query=${encodeURIComponent(scheduleQuery)}`;
     return wrap(
       <div style={{ paddingTop: "20px" }}>
         <div style={{ textAlign: "center", marginBottom: "20px" }}>
@@ -1226,6 +1573,10 @@ export default function App() {
             <a href={`https://map.kakao.com/link/search/${encodeURIComponent(plan.destination.name)}`} target="_blank" rel="noopener noreferrer"
               style={{ display: "block", background: "#FEE500", color: "#3A1D1D", border: "none", borderRadius: "14px", padding: "13px", fontSize: "13px", fontWeight: "700", textAlign: "center", textDecoration: "none", gridColumn: plan.hub || plan.arrivalHub ? "auto" : "1 / -1" }}>
               🗺️ 목적지 지도
+            </a>
+            <a href={scheduleUrl} target="_blank" rel="noopener noreferrer"
+              style={{ display: "block", background: "#ecfeff", color: "#0f766e", border: "2px solid #99f6e4", borderRadius: "14px", padding: "13px", fontSize: "13px", fontWeight: "700", textAlign: "center", textDecoration: "none", gridColumn: "1 / -1" }}>
+              🕒 시간표 검색
             </a>
           </div>
         </Card>

@@ -250,6 +250,7 @@ export function estimateTime(km: number, transportKey: string): string {
     boat: 30,
     ktx: 210,
     rail: 110,
+    subway: 40,
     expressBus: 85,
     intercityBus: 70,
     train: 150,
