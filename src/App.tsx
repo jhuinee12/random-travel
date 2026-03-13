@@ -602,7 +602,14 @@ export default function App() {
         );
       });
 
-    const rows = (await Promise.all(keywords.map((keyword) => runKeywordSearch(keyword)))).flat();
+    const settled = await Promise.allSettled(keywords.map((keyword) => runKeywordSearch(keyword)));
+    const rows = settled
+      .filter((result): result is PromiseFulfilledResult<any[]> => result.status === "fulfilled")
+      .flatMap((result) => result.value);
+    if (rows.length === 0) {
+      const rejected = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (rejected) throw rejected.reason;
+    }
     const mapped: Array<SpinCandidate | null> = rows.map((row) => {
         const categoryName = String(row.category_name ?? "");
         if (selectedTheme?.categoryTokens?.length) {
@@ -818,6 +825,7 @@ export default function App() {
     let source: "real" | "pool" = "pool";
     let candidates: SpinCandidate[] = [];
     let subLabel = "";
+    let searchError: string | null = null;
     const selectedThemeKey = categoryThemeKeys[cat] ?? null;
     const selectedTheme = getThemeByKey(cat, selectedThemeKey);
     const radiusKm = categoryRadii[cat] ?? CATEGORY_META[cat]?.radius ?? 5;
@@ -843,7 +851,8 @@ export default function App() {
             subLabel = `${selectedTheme ? `${selectedTheme.label} 테마 · ` : ""}후보 ${cached.items.length}곳 중 랜덤 (이전 조회값 재사용)`;
           }
         }
-      } catch {
+      } catch (err) {
+        searchError = err instanceof Error ? err.message : "kakao_api_unknown_error";
         if (cacheKey) {
           const cached = nearbyCacheRef.current.get(cacheKey);
           if (cached && Date.now() - cached.at <= CANDIDATE_CACHE_TTL_MS && cached.items.length > 0) {
@@ -856,16 +865,23 @@ export default function App() {
     }
 
     if (candidates.length === 0 && activeTravelCoords) {
+      const isLikelyConfigError = searchError?.includes("missing_kakao_javascript_key")
+        || searchError?.includes("kakao_sdk")
+        || searchError?.includes("kakao_keyword_search_ERROR");
       setSpinResult({
-        pickedName: "조건에 맞는 장소가 없어요",
-        pickedDesc: `${selectedTheme ? `${selectedTheme.label} 테마로 ` : ""}설정한 반경(${radiusKm}km) 내 후보를 찾지 못했습니다.`,
+        pickedName: isLikelyConfigError ? "카카오 API 호출에 실패했어요" : "조건에 맞는 장소가 없어요",
+        pickedDesc: isLikelyConfigError
+          ? "도메인 등록/키 설정 문제일 수 있습니다. 콘솔 에러를 확인해 주세요."
+          : `${selectedTheme ? `${selectedTheme.label} 테마로 ` : ""}설정한 반경(${radiusKm}km) 내 후보를 찾지 못했습니다.`,
         distance: "-",
         direction: "-",
         rating: "-",
         candidates: [],
         pickedIdx: -1,
         source: "real",
-        subLabel: "반경을 넓혀 다시 시도해 주세요.",
+        subLabel: isLikelyConfigError
+          ? `오류 코드: ${searchError ?? "unknown"}`
+          : "반경을 넓혀 다시 시도해 주세요.",
         noMatch: true,
       });
       setStep("spin_result");
