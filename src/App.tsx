@@ -2,9 +2,10 @@ import { useState, useRef, useEffect, useCallback } from "react";
 import { REGIONS, DESTINATIONS, type Region, type District, type Destination } from "./data/korea";
 import {
   haversine, centroid, filterByTransport, findNearest,
-  formatDistance, estimateTime, bearing, pick, pickN,
+  formatDistance, estimateTime, bearing, pick,
   TRANSPORT_HUBS, hubMatchesTransport, type TransportHub,
 } from "./utils/geo";
+import { loadKakaoMapsSdk } from "./utils/kakao";
 
 // ── TRANSPORT DATA ──
 const TRANSPORTS = [
@@ -27,18 +28,11 @@ const CATEGORY_META: Record<string, { label: string; emoji: string; radius: numb
   activity: { label: "액티비티", emoji: "🎡", radius: 5, color: "#45aaf2", bg: "#f0f8ff" },
   lodging: { label: "숙박", emoji: "🛏️", radius: 8, color: "#0ea5e9", bg: "#eef8ff" },
   nextTown: { label: "다음 동네", emoji: "🗺️", radius: 30, color: "#a55eea", bg: "#f8f0ff" },
+  nightView: { label: "야경", emoji: "🌃", radius: 8, color: "#1d4ed8", bg: "#eff6ff" },
+  kidFriendly: { label: "아이동반", emoji: "🧸", radius: 6, color: "#f97316", bg: "#fff7ed" },
+  indoor: { label: "실내", emoji: "🏠", radius: 4, color: "#0f766e", bg: "#ecfeff" },
+  date: { label: "데이트", emoji: "💑", radius: 5, color: "#db2777", bg: "#fdf2f8" },
 };
-
-// 카테고리별 후보 풀 (현장 랜덤용)
-const SPIN_POOL: Record<string, string[]> = {
-  food: ["현지 시장 국밥", "해산물 찜", "로컬 칼국수", "옛날 돼지국밥", "손두부 정식", "향토 비빔밥", "어묵탕 골목", "바다장어구이", "뚝배기 된장찌개", "전통 삼겹살", "매운 닭발", "회센터", "수제버거", "전통 떡볶이", "현지 냉면"],
-  cafe: ["루프탑 뷰 카페", "로스터리 카페", "감성 북카페", "오션뷰 카페", "한옥 찻집", "디저트 전문점", "브런치 카페", "강변 카페", "숲속 카페", "빈티지 카페", "베이커리 카페", "전통 찻집"],
-  attraction: ["전망대", "향토 박물관", "전통 시장", "유명 사찰", "해변 산책로", "한옥마을", "근대 역사거리", "케이블카", "야경 명소", "테마 공원", "수목원", "미술관"],
-  activity: ["자전거 대여", "서핑 체험", "카약 체험", "짚라인", "승마 체험", "도예 체험", "전통 음식 만들기", "야간 산책", "사진 투어", "해돋이 감상", "낚시 체험", "트레킹"],
-  lodging: ["오션뷰 호텔", "가성비 모텔", "조용한 펜션", "리조트", "전통 여관", "시내 비즈니스 호텔"],
-  nextTown: ["해안가 작은 포구", "내륙 산간 마을", "유명 온천 마을", "섬 마을 당일치기", "전통 장터 도시", "인근 국립공원", "강변 유원지", "오래된 역사 도시", "호수 주변 소도시", "벽화마을"],
-};
-
 
 const DEFAULT_CATEGORY_RADII: Record<string, number> = {
   food: 3,
@@ -47,11 +41,82 @@ const DEFAULT_CATEGORY_RADII: Record<string, number> = {
   activity: 5,
   lodging: 5,
   nextTown: 8,
+  nightView: 8,
+  kidFriendly: 6,
+  indoor: 4,
+  date: 5,
 };
 const CANDIDATE_CACHE_TTL_MS = 5 * 60 * 1000;
 
-const OSM_NOMINATIM_BASE = "https://nominatim.openstreetmap.org";
-const OSM_OVERPASS_BASE = "https://overpass-api.de/api/interpreter";
+const KAKAO_CATEGORY_KEYWORDS: Record<string, string[]> = {
+  food: ["맛집", "음식점", "한식"],
+  cafe: ["카페", "디저트 카페", "브런치 카페"],
+  attraction: ["관광지", "명소", "박물관"],
+  activity: ["체험", "레저", "액티비티"],
+  lodging: ["호텔", "펜션", "게스트하우스"],
+  nextTown: ["버스터미널", "기차역", "읍사무소"],
+  nightView: ["야경 명소", "전망대", "루프탑"],
+  kidFriendly: ["키즈카페", "테마파크", "동물원"],
+  indoor: ["실내 관광지", "박물관", "전시관"],
+  date: ["데이트 코스", "감성 카페", "전망 좋은 곳"],
+};
+
+type CategoryTheme = {
+  key: string;
+  label: string;
+  keywords: string[];
+  categoryTokens?: string[];
+};
+
+const KAKAO_CATEGORY_GROUP_BY_CAT: Record<string, string | undefined> = {
+  food: "FD6",
+  cafe: "CE7",
+  lodging: "AD5",
+  attraction: "AT4",
+};
+
+const CATEGORY_THEMES: Record<string, CategoryTheme[]> = {
+  food: [
+    { key: "all", label: "전체", keywords: ["맛집", "음식점", "한식"] },
+    { key: "korean", label: "한식", keywords: ["한식 맛집", "백반", "국밥"], categoryTokens: ["한식"] },
+    { key: "japanese", label: "일식", keywords: ["일식", "초밥", "라멘"], categoryTokens: ["일식"] },
+    { key: "chinese", label: "중식", keywords: ["중식", "중화요리", "짜장면"], categoryTokens: ["중식"] },
+    { key: "western", label: "양식", keywords: ["파스타", "스테이크", "이탈리안"], categoryTokens: ["양식", "이탈리안"] },
+    { key: "snack", label: "분식", keywords: ["분식", "떡볶이", "김밥"], categoryTokens: ["분식"] },
+    { key: "meat", label: "고기", keywords: ["고기집", "삼겹살", "갈비"], categoryTokens: ["고기", "육류"] },
+    { key: "seafood", label: "해산물", keywords: ["해산물", "횟집", "조개구이"], categoryTokens: ["해물", "수산", "회"] },
+    { key: "chicken", label: "치킨", keywords: ["치킨", "닭강정", "통닭"], categoryTokens: ["치킨"] },
+    { key: "lateNight", label: "야식", keywords: ["포장마차", "심야식당", "야식"], categoryTokens: ["술집", "포차", "호프"] },
+  ],
+  attraction: [
+    { key: "all", label: "전체", keywords: ["관광지", "명소", "박물관"] },
+    { key: "nature", label: "자연", keywords: ["공원", "해변", "산책로"] },
+    { key: "history", label: "역사", keywords: ["유적지", "문화재", "전통마을"] },
+    { key: "museum", label: "전시", keywords: ["박물관", "미술관", "전시관"] },
+    { key: "photo", label: "포토", keywords: ["포토스팟", "전망대", "인생샷"] },
+  ],
+  activity: [
+    { key: "all", label: "전체", keywords: ["체험", "레저", "액티비티"] },
+    { key: "sports", label: "스포츠", keywords: ["클라이밍", "볼링장", "스포츠센터"] },
+    { key: "water", label: "수상", keywords: ["카약", "서핑", "수상레저"] },
+    { key: "craft", label: "공방", keywords: ["공방 체험", "원데이클래스", "도예 체험"] },
+    { key: "kids", label: "가족", keywords: ["체험관", "키즈 체험", "테마파크"] },
+  ],
+  lodging: [
+    { key: "all", label: "전체", keywords: ["호텔", "펜션", "게스트하우스"] },
+    { key: "hotel", label: "호텔", keywords: ["비즈니스 호텔", "부티크 호텔", "시티호텔"] },
+    { key: "pension", label: "펜션", keywords: ["감성 펜션", "독채 펜션", "풀빌라"] },
+    { key: "hanok", label: "한옥", keywords: ["한옥스테이", "전통 숙소", "고택 숙소"] },
+    { key: "cost", label: "가성비", keywords: ["가성비 숙소", "모텔", "저렴한 숙소"] },
+  ],
+};
+
+function getThemeByKey(cat: string, themeKey?: string | null): CategoryTheme | null {
+  if (!themeKey) return null;
+  const themes = CATEGORY_THEMES[cat];
+  if (!themes) return null;
+  return themes.find((theme) => theme.key === themeKey) ?? null;
+}
 
 // ── STEPS ──
 type Step = "home" | "input" | "settings" | "planning" | "plan_result" | "travel" | "spinning" | "spin_result";
@@ -102,7 +167,8 @@ function getSortedNameIndexPairs(items: { name: string }[]): Array<{ idx: number
 }
 
 function getRadiusMaxKm(cat: string): number {
-  if (cat === "food" || cat === "cafe" || cat === "lodging") return 10;
+  if (cat === "food" || cat === "cafe" || cat === "lodging" || cat === "indoor") return 10;
+  if (cat === "kidFriendly" || cat === "date") return 15;
   return 20;
 }
 
@@ -262,67 +328,52 @@ const MapPicker = ({
   const ref = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
   const markerRef = useRef<any>(null);
+  const clickHandlerRef = useRef<((mouseEvent: any) => void) | null>(null);
 
   useEffect(() => {
-    let mounted = true;
-    const load = async () => {
-      if (!(window as any).L) {
-        if (!document.querySelector('link[data-leaflet="1"]')) {
-          const link = document.createElement("link");
-          link.rel = "stylesheet";
-          link.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
-          link.setAttribute("data-leaflet", "1");
-          document.head.appendChild(link);
-        }
-        await new Promise<void>((resolve, reject) => {
-          const existing = document.querySelector('script[data-leaflet="1"]') as HTMLScriptElement | null;
-          if (existing) {
-            if ((window as any).L) resolve();
-            else existing.addEventListener("load", () => resolve(), { once: true });
-            return;
-          }
-          const s = document.createElement("script");
-          s.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
-          s.async = true;
-          s.setAttribute("data-leaflet", "1");
-          s.onload = () => resolve();
-          s.onerror = () => reject(new Error("leaflet_load_failed"));
-          document.body.appendChild(s);
-        });
-      }
-      if (!mounted || !ref.current || mapRef.current) return;
-      const L = (window as any).L;
-      mapRef.current = L.map(ref.current).setView([center.lat, center.lng], 13);
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 19,
-        attribution: "&copy; OpenStreetMap contributors",
-      }).addTo(mapRef.current);
-      mapRef.current.on("click", (e: any) => {
-        onPick({ lat: e.latlng.lat, lng: e.latlng.lng });
+    let cancelled = false;
+    const initMap = async () => {
+      const kakao = await loadKakaoMapsSdk();
+      if (cancelled || !ref.current || mapRef.current) return;
+      mapRef.current = new kakao.maps.Map(ref.current, {
+        center: new kakao.maps.LatLng(center.lat, center.lng),
+        level: 4,
       });
+      clickHandlerRef.current = (mouseEvent: any) => {
+        const latLng = mouseEvent.latLng;
+        onPick({ lat: latLng.getLat(), lng: latLng.getLng() });
+      };
+      kakao.maps.event.addListener(mapRef.current, "click", clickHandlerRef.current);
     };
-    load().catch(() => void 0);
+    initMap().catch(() => void 0);
     return () => {
-      mounted = false;
-      if (mapRef.current) {
-        mapRef.current.remove();
-        mapRef.current = null;
-        markerRef.current = null;
+      cancelled = true;
+      const kakao = (window as any).kakao;
+      if (mapRef.current && clickHandlerRef.current && kakao?.maps?.event) {
+        kakao.maps.event.removeListener(mapRef.current, "click", clickHandlerRef.current);
       }
+      if (markerRef.current) markerRef.current.setMap(null);
+      markerRef.current = null;
+      mapRef.current = null;
+      clickHandlerRef.current = null;
     };
   }, []);
 
   useEffect(() => {
     if (!mapRef.current) return;
-    const L = (window as any).L;
+    const kakao = (window as any).kakao;
+    if (!kakao?.maps) return;
     if (selected) {
-      if (!markerRef.current) markerRef.current = L.marker([selected.lat, selected.lng]).addTo(mapRef.current);
-      else markerRef.current.setLatLng([selected.lat, selected.lng]);
-      mapRef.current.setView([selected.lat, selected.lng], Math.max(mapRef.current.getZoom(), 14));
+      const pos = new kakao.maps.LatLng(selected.lat, selected.lng);
+      if (!markerRef.current) markerRef.current = new kakao.maps.Marker({ position: pos, map: mapRef.current });
+      else markerRef.current.setPosition(pos);
+      mapRef.current.setCenter(pos);
+      mapRef.current.setLevel(3);
     } else {
-      mapRef.current.setView([center.lat, center.lng], 13);
+      mapRef.current.setCenter(new kakao.maps.LatLng(center.lat, center.lng));
+      mapRef.current.setLevel(4);
       if (markerRef.current) {
-        mapRef.current.removeLayer(markerRef.current);
+        markerRef.current.setMap(null);
         markerRef.current = null;
       }
     }
@@ -364,6 +415,12 @@ export default function App() {
   const [currentAddr, setCurrentAddr] = useState<string>("");
   const [selectedConfigCat, setSelectedConfigCat] = useState<string | null>(null);
   const [categoryRadii, setCategoryRadii] = useState<Record<string, number>>({ ...DEFAULT_CATEGORY_RADII });
+  const [categoryThemeKeys, setCategoryThemeKeys] = useState<Record<string, string>>({
+    food: "all",
+    attraction: "all",
+    activity: "all",
+    lodging: "all",
+  });
   const nearbyCacheRef = useRef<Map<string, { at: number; items: SpinCandidate[] }>>(new Map());
 
   useEffect(() => {
@@ -472,29 +529,23 @@ export default function App() {
   const isManualReady = manualPoint !== null;
 
   const fetchCurrentAddress = useCallback(async (lat: number, lng: number) => {
-    type NominatimReverse = {
-      display_name?: string;
-      address?: {
-        suburb?: string;
-        city_district?: string;
-        city?: string;
-        town?: string;
-        village?: string;
-      };
-    };
-    const qs = new URLSearchParams({
-      format: "jsonv2",
-      lat: String(lat),
-      lon: String(lng),
-      "accept-language": "ko",
-    }).toString();
-    const res = await fetch(`${OSM_NOMINATIM_BASE}/reverse?${qs}`);
-    if (!res.ok) {
-      setCurrentAddr("");
-      return;
-    }
-    const data = (await res.json()) as NominatimReverse;
-    const addr = data.address?.suburb || data.address?.city_district || data.address?.city || data.address?.town || data.address?.village || data.display_name || "";
+    const kakao = await loadKakaoMapsSdk();
+    const geocoder = new kakao.maps.services.Geocoder();
+    const addr = await new Promise<string>((resolve) => {
+      geocoder.coord2Address(lng, lat, (result: any, status: string) => {
+        if (status !== kakao.maps.services.Status.OK || !result?.[0]) {
+          resolve("");
+          return;
+        }
+        const first = result[0];
+        resolve(
+          first.road_address?.address_name ||
+          first.address?.region_3depth_name ||
+          first.address?.address_name ||
+          ""
+        );
+      });
+    });
     setCurrentAddr(addr);
   }, []);
 
@@ -518,142 +569,63 @@ export default function App() {
     cat: string,
     lat: number,
     lng: number,
-    opts?: { radiusMeters?: number }
+    opts?: { radiusMeters?: number; themeKey?: string | null }
   ): Promise<SpinCandidate[]> => {
-    type OverpassElement = {
-      type: "node" | "way" | "relation";
-      id: number;
-      lat?: number;
-      lon?: number;
-      center?: { lat: number; lon: number };
-      tags?: Record<string, string>;
-    };
-    type OverpassResp = { elements?: OverpassElement[] };
-
     const requestedRadiusMeters = Math.min(
       20000,
       Math.max(500, opts?.radiusMeters ?? Math.round((categoryRadii[cat] ?? CATEGORY_META[cat]?.radius ?? 5) * 1000))
     );
-    // 작은 반경(0.5~1km)에서 API 누락이 자주 발생해, 조회는 조금 넓게 하고
-    // 최종 후보는 요청 반경으로 정확히 다시 필터링한다.
-    const queryRadiusMeters = Math.min(20000, Math.max(2500, requestedRadiusMeters));
-    const around = `(around:${queryRadiusMeters},${lat},${lng})`;
-    const buildByTag = (filters: string[]) => filters
-      .map((f) => `node${f}${around};way${f}${around};relation${f}${around};`)
-      .join("\n");
+    const kakao = await loadKakaoMapsSdk();
+    const places = new kakao.maps.services.Places();
+    const center = new kakao.maps.LatLng(lat, lng);
+    const selectedTheme = getThemeByKey(cat, opts?.themeKey);
+    const keywords = selectedTheme?.keywords ?? KAKAO_CATEGORY_KEYWORDS[cat] ?? [CATEGORY_META[cat]?.label ?? "명소"];
+    const groupCode = KAKAO_CATEGORY_GROUP_BY_CAT[cat];
+    const searchRadiusMeters = Math.min(20000, Math.max(1000, requestedRadiusMeters));
 
-    let queryBody = "";
-    if (cat === "food") {
-      queryBody = buildByTag([`["amenity"="restaurant"]`, `["amenity"="fast_food"]`, `["amenity"="food_court"]`]);
-    } else if (cat === "cafe") {
-      // 카페는 안정적으로 수집되는 태그 중심으로 조회 (과도한 regex는 응답 불안정 유발)
-      queryBody = buildByTag([
-        `["amenity"="cafe"]`,
-        `["shop"="coffee"]`,
-        `["shop"="beverages"]`,
-        `["amenity"="ice_cream"]`,
-      ]);
-    } else if (cat === "attraction") {
-      queryBody = buildByTag([`["tourism"="attraction"]`, `["tourism"="museum"]`, `["tourism"="viewpoint"]`, `["leisure"="park"]`]);
-    } else if (cat === "activity") {
-      queryBody = buildByTag([
-        `["tourism"="theme_park"]`,
-        `["tourism"="zoo"]`,
-        `["tourism"="aquarium"]`,
-        `["leisure"="sports_centre"]`,
-        `["leisure"="fitness_centre"]`,
-        `["leisure"="swimming_pool"]`,
-        `["leisure"="water_park"]`,
-        `["leisure"="bowling_alley"]`,
-        `["leisure"="amusement_arcade"]`,
-        `["sport"]`,
-        `["amenity"="cinema"]`,
-        `["amenity"="karaoke_box"]`,
-        `["amenity"="billiards"]`,
-      ]);
-    } else if (cat === "lodging") {
-      queryBody = buildByTag([`["tourism"="hotel"]`, `["tourism"="motel"]`, `["tourism"="guest_house"]`, `["tourism"="hostel"]`]);
-    } else {
-      queryBody = buildByTag([`["place"="town"]`, `["place"="village"]`, `["railway"="station"]`, `["amenity"="bus_station"]`]);
-    }
-
-    const overpassQuery = `[out:json][timeout:25];
-(
-${queryBody}
-);
-out center 600;`;
-
-    const runOverpass = async (query: string): Promise<OverpassResp | null> => {
-      let data: OverpassResp | null = null;
-      let lastErr: unknown = null;
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        try {
-          const res = await fetch(OSM_OVERPASS_BASE, {
-            method: "POST",
-            headers: { "Content-Type": "text/plain;charset=UTF-8" },
-            body: query,
-          });
-          if (!res.ok) throw new Error(`overpass_http_${res.status}`);
-          data = (await res.json()) as OverpassResp;
-          lastErr = null;
-          break;
-        } catch (err) {
-          lastErr = err;
-          await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
-        }
-      }
-      if (!data && lastErr) throw lastErr;
-      return data;
-    };
-
-    let data: OverpassResp | null = await runOverpass(overpassQuery);
-    if (cat === "cafe" && (!data?.elements || data.elements.length === 0)) {
-      const cafeFallbackQuery = `[out:json][timeout:25];
-(
-${buildByTag([`["amenity"="cafe"]`])}
-);
-out center 600;`;
-      data = await runOverpass(cafeFallbackQuery);
-    }
-    if (!data) throw new Error("overpass_failed");
-    const elements = data.elements ?? [];
-
-    const popularityOf = (e: OverpassElement, distanceKm: number): number => {
-      const t = e.tags ?? {};
-      let score = 0;
-      if (t.wikipedia) score += 10;
-      if (t.wikidata) score += 8;
-      if (t.tourism === "attraction") score += 7;
-      if (t.tourism === "museum" || t.tourism === "theme_park" || t.tourism === "viewpoint") score += 6;
-      if (t.historic) score += 5;
-      if (t.leisure) score += 3;
-      if (t.amenity === "bus_station" || t.railway === "station") score += 4;
-      if (e.type === "way" || e.type === "relation") score += 2;
-      if (t.name?.includes("국립") || t.name?.includes("랜드")) score += 2;
-      score += Math.max(0, 5 - distanceKm); // 너무 멀면 점수 하락
-      return score;
-    };
-
-    const out: SpinCandidate[] = [];
-    for (const e of elements) {
-      const pLat = e.lat ?? e.center?.lat;
-      const pLng = e.lon ?? e.center?.lon;
-      if (pLat === undefined || pLng === undefined) continue;
-      if (cat === "activity" && e.tags?.amenity === "sauna") continue;
-      const name = e.tags?.["name:ko"] || e.tags?.name || e.tags?.["brand:ko"] || e.tags?.brand || e.tags?.official_name;
-      if (!name) continue;
-      const distanceKm = haversine(lat, lng, pLat, pLng);
-      if (distanceKm > requestedRadiusMeters / 1000) continue;
-      out.push({
-        name,
-        address: [e.tags?.["addr:city"], e.tags?.["addr:suburb"], e.tags?.["addr:street"]].filter(Boolean).join(" "),
-        distanceKm,
-        lat: pLat,
-        lng: pLng,
-        placeUrl: `https://www.openstreetmap.org/${e.type}/${e.id}`,
-        popularity: popularityOf(e, distanceKm),
+    const runKeywordSearch = (keyword: string): Promise<any[]> =>
+      new Promise((resolve, reject) => {
+        places.keywordSearch(
+          keyword,
+          (data: any[], status: string) => {
+            if (status === kakao.maps.services.Status.OK) resolve(data ?? []);
+            else if (status === kakao.maps.services.Status.ZERO_RESULT) resolve([]);
+            else reject(new Error(`kakao_keyword_search_${status}`));
+          },
+          {
+            location: center,
+            radius: searchRadiusMeters,
+            sort: kakao.maps.services.SortBy.DISTANCE,
+            size: 15,
+            ...(groupCode ? { category_group_code: groupCode } : {}),
+          }
+        );
       });
-    };
+
+    const rows = (await Promise.all(keywords.map((keyword) => runKeywordSearch(keyword)))).flat();
+    const mapped: Array<SpinCandidate | null> = rows.map((row) => {
+        const categoryName = String(row.category_name ?? "");
+        if (selectedTheme?.categoryTokens?.length) {
+          const matched = selectedTheme.categoryTokens.some((token) => categoryName.includes(token));
+          if (!matched) return null;
+        }
+        const pLat = Number(row.y);
+        const pLng = Number(row.x);
+        if (!Number.isFinite(pLat) || !Number.isFinite(pLng)) return null;
+        const fallbackDistanceKm = haversine(lat, lng, pLat, pLng);
+        const distanceKm = row.distance ? Number(row.distance) / 1000 : fallbackDistanceKm;
+        if (!Number.isFinite(distanceKm) || distanceKm > requestedRadiusMeters / 1000) return null;
+        return {
+          name: row.place_name,
+          address: row.road_address_name || row.address_name || "",
+          distanceKm,
+          lat: pLat,
+          lng: pLng,
+          placeUrl: row.place_url,
+          popularity: Math.max(0, 5 - distanceKm),
+        };
+      });
+    const out = mapped.filter((item): item is SpinCandidate => item !== null);
 
     const uniq = new Map<string, SpinCandidate>();
     for (const c of out) {
@@ -846,26 +818,29 @@ out center 600;`;
     let source: "real" | "pool" = "pool";
     let candidates: SpinCandidate[] = [];
     let subLabel = "";
+    const selectedThemeKey = categoryThemeKeys[cat] ?? null;
+    const selectedTheme = getThemeByKey(cat, selectedThemeKey);
     const radiusKm = categoryRadii[cat] ?? CATEGORY_META[cat]?.radius ?? 5;
     const cacheKey = activeTravelCoords
-      ? `${cat}:${activeTravelCoords.lat.toFixed(4)},${activeTravelCoords.lng.toFixed(4)}:${radiusKm.toFixed(1)}`
+      ? `${cat}:${selectedThemeKey ?? "none"}:${activeTravelCoords.lat.toFixed(4)},${activeTravelCoords.lng.toFixed(4)}:${radiusKm.toFixed(1)}`
       : null;
     if (activeTravelCoords) {
       try {
         const nearby = await fetchNearbyCandidates(cat, activeTravelCoords.lat, activeTravelCoords.lng, {
           radiusMeters: Math.round(radiusKm * 1000),
+          themeKey: selectedThemeKey,
         });
         if (nearby.length > 0) {
           candidates = nearby;
           source = "real";
-          subLabel = `후보 ${nearby.length}곳 중 랜덤`;
+          subLabel = `${selectedTheme ? `${selectedTheme.label} 테마 · ` : ""}후보 ${nearby.length}곳 중 랜덤`;
           if (cacheKey) nearbyCacheRef.current.set(cacheKey, { at: Date.now(), items: nearby });
         } else if (cacheKey) {
           const cached = nearbyCacheRef.current.get(cacheKey);
           if (cached && Date.now() - cached.at <= CANDIDATE_CACHE_TTL_MS && cached.items.length > 0) {
             candidates = cached.items;
             source = "real";
-            subLabel = `후보 ${cached.items.length}곳 중 랜덤 (이전 조회값 재사용)`;
+            subLabel = `${selectedTheme ? `${selectedTheme.label} 테마 · ` : ""}후보 ${cached.items.length}곳 중 랜덤 (이전 조회값 재사용)`;
           }
         }
       } catch {
@@ -874,7 +849,7 @@ out center 600;`;
           if (cached && Date.now() - cached.at <= CANDIDATE_CACHE_TTL_MS && cached.items.length > 0) {
             candidates = cached.items;
             source = "real";
-            subLabel = `후보 ${cached.items.length}곳 중 랜덤 (조회 불안정으로 캐시 사용)`;
+            subLabel = `${selectedTheme ? `${selectedTheme.label} 테마 · ` : ""}후보 ${cached.items.length}곳 중 랜덤 (조회 불안정으로 캐시 사용)`;
           }
         }
       }
@@ -883,7 +858,7 @@ out center 600;`;
     if (candidates.length === 0 && activeTravelCoords) {
       setSpinResult({
         pickedName: "조건에 맞는 장소가 없어요",
-        pickedDesc: `설정한 반경(${radiusKm}km) 내 후보를 찾지 못했습니다.`,
+        pickedDesc: `${selectedTheme ? `${selectedTheme.label} 테마로 ` : ""}설정한 반경(${radiusKm}km) 내 후보를 찾지 못했습니다.`,
         distance: "-",
         direction: "-",
         rating: "-",
@@ -898,10 +873,22 @@ out center 600;`;
     }
 
     if (candidates.length === 0) {
-      const pool = SPIN_POOL[cat] || [];
-      candidates = pickN(pool, Math.min(5, pool.length)).map((name) => ({ name }));
-      source = "pool";
-      subLabel = "";
+      setSpinResult({
+        pickedName: "주변 후보를 찾지 못했어요",
+        pickedDesc: activeTravelCoords
+          ? `${selectedTheme ? `${selectedTheme.label} 테마로 ` : ""}설정한 반경(${radiusKm}km) 내 카카오 검색 결과가 없습니다.`
+          : "GPS 또는 직접 위치 선택 후 다시 시도해 주세요.",
+        distance: "-",
+        direction: "-",
+        rating: "-",
+        candidates: [],
+        pickedIdx: -1,
+        source: "real",
+        subLabel: "반경을 넓히거나 카테고리를 바꿔 다시 시도해 주세요.",
+        noMatch: true,
+      });
+      setStep("spin_result");
+      return;
     }
 
     const finalIdx = Math.floor(Math.random() * candidates.length);
@@ -1403,6 +1390,37 @@ out center 600;`;
             {CATEGORY_META[selectedConfigCat].emoji} {CATEGORY_META[selectedConfigCat].label} 설정
           </div>
 
+          {CATEGORY_THEMES[selectedConfigCat] && CATEGORY_THEMES[selectedConfigCat].length > 0 && (
+            <div style={{ marginBottom: "12px" }}>
+              <div style={{ fontWeight: "700", color: P.gray, fontSize: "12px", marginBottom: "8px" }}>
+                세부 테마
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                {CATEGORY_THEMES[selectedConfigCat].map((theme) => {
+                  const active = (categoryThemeKeys[selectedConfigCat] ?? "all") === theme.key;
+                  return (
+                    <button
+                      key={theme.key}
+                      onClick={() => setCategoryThemeKeys((prev) => ({ ...prev, [selectedConfigCat]: theme.key }))}
+                      style={{
+                        padding: "6px 10px",
+                        borderRadius: "14px",
+                        border: `2px solid ${active ? CATEGORY_META[selectedConfigCat].color : P.border}`,
+                        background: active ? CATEGORY_META[selectedConfigCat].bg : P.white,
+                        color: active ? CATEGORY_META[selectedConfigCat].color : P.gray,
+                        fontSize: "12px",
+                        fontWeight: active ? "700" : "600",
+                        cursor: "pointer",
+                      }}
+                    >
+                      {theme.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           <div style={{ marginBottom: "10px" }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
               <div style={{ fontWeight: "700", color: P.gray, fontSize: "12px" }}>검색 반경</div>
@@ -1492,6 +1510,7 @@ out center 600;`;
     const mapViewUrl = pickedCandidate?.lat !== undefined && pickedCandidate?.lng !== undefined
       ? `https://map.kakao.com/link/map/${encodeURIComponent(spinResult.pickedName)},${pickedCandidate.lat},${pickedCandidate.lng}`
       : `https://map.kakao.com/link/search/${encodeURIComponent(spinResult.pickedName)}`;
+    const placeDetailUrl = pickedCandidate?.placeUrl ?? mapViewUrl;
 
     return wrap(
       <div style={{ paddingTop: "20px" }}>
@@ -1546,12 +1565,18 @@ out center 600;`;
           {spinResult.noMatch ? (
             <Btn variant="secondary" onClick={() => setStep("travel")}>🔧 조건 다시 설정</Btn>
           ) : (
-            <a href={mapViewUrl} target="_blank" rel="noopener noreferrer"
-              style={{ display: "block", background: "#FEE500", color: "#3A1D1D", border: "none", borderRadius: "14px", padding: "13px", fontSize: "14px", fontWeight: "700", textAlign: "center", textDecoration: "none" }}>
-              🗺️ 카카오맵에서 위치 보기
-            </a>
+            <>
+              <a href={placeDetailUrl} target="_blank" rel="noopener noreferrer"
+                style={{ display: "block", background: "#FEE500", color: "#3A1D1D", border: "none", borderRadius: "14px", padding: "13px", fontSize: "14px", fontWeight: "700", textAlign: "center", textDecoration: "none" }}>
+                🔎 카카오맵 상세 보기
+              </a>
+              <a href={mapViewUrl} target="_blank" rel="noopener noreferrer"
+                style={{ display: "block", background: "#fff7cc", color: "#3A1D1D", border: "1px solid #FEE500", borderRadius: "14px", padding: "13px", fontSize: "14px", fontWeight: "700", textAlign: "center", textDecoration: "none" }}>
+                🗺️ 카카오맵에서 위치 보기
+              </a>
+            </>
           )}
-          <Btn variant="outline" onClick={() => startSpin(spinCat!)}>🔄 다시 뽑기</Btn>
+          <Btn variant="outline" onClick={() => startSpin(spinCat!)} style={spinResult.noMatch ? {} : { gridColumn: "1 / -1" }}>🔄 다시 뽑기</Btn>
         </div>
         <Btn onClick={() => setStep("travel")}>← 여행 모드로 돌아가기</Btn>
       </div>
