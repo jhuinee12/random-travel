@@ -463,6 +463,59 @@ async function fetchDestinationPool(
     });
 }
 
+async function fetchDestinationUniverse(
+  center: { lat: number; lng: number },
+  transportKey: string
+): Promise<KakaoPlace[]> {
+  const config = TRANSPORT_SEARCH_CONFIG[transportKey];
+  if (!config) return [];
+  const nearby = await collectKeywordPlaces(config.destinationKeywords, {
+    lat: center.lat,
+    lng: center.lng,
+    radiusMeters: 20000,
+    pages: 1,
+    sort: "distance",
+  });
+  const nationwide = await collectKeywordPlaces(config.destinationKeywords, {
+    pages: 1,
+    sort: "accuracy",
+  });
+  const uniq = new Map<string, KakaoPlace>();
+  for (const place of [...nearby, ...nationwide]) {
+    const key = placeKeyOf(place);
+    if (!uniq.has(key)) uniq.set(key, place);
+  }
+  return Array.from(uniq.values());
+}
+
+function filterByDistanceWindow(
+  origin: { lat: number; lng: number },
+  places: KakaoPlace[],
+  windowKm: { minKm: number; maxKm: number }
+): KakaoPlace[] {
+  return places.filter((place) => {
+    const km = haversine(origin.lat, origin.lng, place.lat, place.lng);
+    return km >= windowKm.minKm && km <= windowKm.maxKm;
+  });
+}
+
+function getPlanErrorMessage(err: unknown): string {
+  const code = err instanceof Error ? err.message : String(err ?? "unknown");
+  if (code.includes("missing_kakao_rest_api_key")) {
+    return "카카오 REST API 키가 없어 계획 생성을 할 수 없습니다.";
+  }
+  if (code.includes("kakao_rest_401") || code.includes("kakao_rest_403")) {
+    return "카카오 REST API 인증이 거부되었습니다. REST 키/플랫폼 설정을 확인해 주세요.";
+  }
+  if (code.includes("kakao_rest_429")) {
+    return "요청이 너무 많아 일시적으로 제한되었습니다. 잠시 후 다시 시도해 주세요.";
+  }
+  if (code.includes("no_live_destination_found")) {
+    return "현재 조건에 맞는 실시간 목적지를 찾지 못했습니다. 교통수단이나 여행 기간을 바꿔 다시 시도해 주세요.";
+  }
+  return "실시간 검색 기반 계획 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.";
+}
+
 async function findBestArrivalHub(
   destination: { lat: number; lng: number },
   transportKey: string
@@ -1026,9 +1079,11 @@ export default function App() {
     let hub: TransportHub | null = null;
     let selectedRoute: { destination: Destination; arrivalHub: TransportHub | null; routeKm: number } | null = null;
     try {
+      const globalDestinationPool = await fetchDestinationUniverse(center, pickedTransport.key);
+
       if (isPublic) {
         const fetchedHubs = await fetchOriginHubs(center, pickedTransport.key);
-        const candidateHubs = fetchedHubs.slice(0, 6);
+        const candidateHubs = fetchedHubs.slice(0, 4);
         const scoredPlans: Array<{
           score: number;
           originHub: TransportHub | null;
@@ -1046,8 +1101,26 @@ export default function App() {
           const accessMin = Math.min(...accessDists);
           const accessGap = accessMax - accessMin;
 
-          const destPool = await fetchDestinationPool(origin, pickedTransport.key, distanceWindow);
-          if (destPool.length === 0) continue;
+          const config = TRANSPORT_SEARCH_CONFIG[pickedTransport.key];
+          let destPool = filterByDistanceWindow(origin, globalDestinationPool, distanceWindow);
+          if (destPool.length < 8 && config) {
+            const nearbyExtra = await collectKeywordPlaces(config.destinationKeywords, {
+              lat: origin.lat,
+              lng: origin.lng,
+              radiusMeters: 20000,
+              pages: 1,
+              sort: "distance",
+            });
+            const merged = new Map<string, KakaoPlace>();
+            for (const place of [...destPool, ...nearbyExtra]) {
+              const key = placeKeyOf(place);
+              if (!merged.has(key)) merged.set(key, place);
+            }
+            destPool = filterByDistanceWindow(origin, Array.from(merged.values()), distanceWindow);
+          }
+          if (destPool.length === 0) {
+            continue;
+          }
           const uniqByPlace = new Map<string, KakaoPlace>();
           for (const place of destPool) {
             const key = placeKeyOf(place);
@@ -1093,7 +1166,10 @@ export default function App() {
       const origin = hub ? { lat: hub.lat, lng: hub.lng } : center;
 
       if (!selectedRoute) {
-        const destPool = await fetchDestinationPool(origin, pickedTransport.key, distanceWindow);
+        let destPool = filterByDistanceWindow(origin, globalDestinationPool, distanceWindow);
+        if (destPool.length < 10) {
+          destPool = await fetchDestinationPool(origin, pickedTransport.key, distanceWindow);
+        }
         if (destPool.length === 0) {
           throw new Error("no_live_destination_found");
         }
@@ -1147,7 +1223,7 @@ export default function App() {
     } catch (err) {
       console.error(err);
       setStep("settings");
-      window.alert("실시간 검색 기반 계획 생성에 실패했습니다. 잠시 후 다시 시도해 주세요.");
+      window.alert(getPlanErrorMessage(err));
     }
   };
 
