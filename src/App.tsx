@@ -86,7 +86,7 @@ const CATEGORY_THEMES: Record<string, CategoryTheme[]> = {
     { key: "meat", label: "고기", keywords: ["고기집", "삼겹살", "갈비"], categoryTokens: ["고기", "육류"] },
     { key: "seafood", label: "해산물", keywords: ["해산물", "횟집", "조개구이"], categoryTokens: ["해물", "수산", "회"] },
     { key: "chicken", label: "치킨", keywords: ["치킨", "닭강정", "통닭"], categoryTokens: ["치킨"] },
-    { key: "lateNight", label: "야식", keywords: ["포장마차", "심야식당", "야식"], categoryTokens: ["술집", "포차", "호프"] },
+    { key: "bar", label: "술집", keywords: ["술집", "포장마차", "이자카야"], categoryTokens: ["주점", "술집", "호프", "와인", "이자카야", "포차"] },
   ],
   attraction: [
     { key: "all", label: "전체", keywords: ["관광지", "명소", "박물관"] },
