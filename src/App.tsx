@@ -25,6 +25,7 @@ const CATEGORY_META: Record<string, { label: string; emoji: string; radius: numb
   cafe: { label: "카페", emoji: "☕", radius: 1.5, color: "#FF9F43", bg: "#fff9f0" },
   attraction: { label: "관광지", emoji: "🏛️", radius: 5, color: "#26de81", bg: "#f0fff6" },
   activity: { label: "액티비티", emoji: "🎡", radius: 5, color: "#45aaf2", bg: "#f0f8ff" },
+  lodging: { label: "숙박", emoji: "🛏️", radius: 8, color: "#0ea5e9", bg: "#eef8ff" },
   nextTown: { label: "다음 동네", emoji: "🗺️", radius: 30, color: "#a55eea", bg: "#f8f0ff" },
 };
 
@@ -34,11 +35,20 @@ const SPIN_POOL: Record<string, string[]> = {
   cafe: ["루프탑 뷰 카페", "로스터리 카페", "감성 북카페", "오션뷰 카페", "한옥 찻집", "디저트 전문점", "브런치 카페", "강변 카페", "숲속 카페", "빈티지 카페", "베이커리 카페", "전통 찻집"],
   attraction: ["전망대", "향토 박물관", "전통 시장", "유명 사찰", "해변 산책로", "한옥마을", "근대 역사거리", "케이블카", "야경 명소", "테마 공원", "수목원", "미술관"],
   activity: ["자전거 대여", "서핑 체험", "카약 체험", "짚라인", "승마 체험", "도예 체험", "전통 음식 만들기", "야간 산책", "사진 투어", "해돋이 감상", "낚시 체험", "트레킹"],
+  lodging: ["오션뷰 호텔", "가성비 모텔", "조용한 펜션", "리조트", "전통 여관", "시내 비즈니스 호텔"],
   nextTown: ["해안가 작은 포구", "내륙 산간 마을", "유명 온천 마을", "섬 마을 당일치기", "전통 장터 도시", "인근 국립공원", "강변 유원지", "오래된 역사 도시", "호수 주변 소도시", "벽화마을"],
 };
 
-const FOOD_MENUS = ["국밥", "칼국수", "냉면", "돈까스", "초밥", "파스타", "삼겹살", "해장국", "쌀국수", "치킨"];
-const CAFE_THEMES = ["디저트", "브런치", "로스터리", "베이커리", "감성", "뷰", "한옥", "조용한"];
+
+const DEFAULT_CATEGORY_RADII: Record<string, number> = {
+  food: 3,
+  cafe: 3,
+  attraction: 5,
+  activity: 5,
+  lodging: 5,
+  nextTown: 8,
+};
+const CANDIDATE_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const OSM_NOMINATIM_BASE = "https://nominatim.openstreetmap.org";
 const OSM_OVERPASS_BASE = "https://overpass-api.de/api/interpreter";
@@ -89,6 +99,11 @@ function getSortedNameIndexPairs(items: { name: string }[]): Array<{ idx: number
   return items
     .map((item, idx) => ({ idx, name: item.name }))
     .sort((a, b) => a.name.localeCompare(b.name, "ko-KR"));
+}
+
+function getRadiusMaxKm(cat: string): number {
+  if (cat === "food" || cat === "cafe" || cat === "lodging") return 10;
+  return 20;
 }
 
 function getLastMileLimit(transportKey: string): number {
@@ -235,6 +250,87 @@ const SelectableList = ({ items, selectedIdx, onSelect, columns = 3 }: {
   </div>
 );
 
+const MapPicker = ({
+  center,
+  selected,
+  onPick,
+}: {
+  center: { lat: number; lng: number };
+  selected: { lat: number; lng: number } | null;
+  onPick: (coords: { lat: number; lng: number }) => void;
+}) => {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<any>(null);
+  const markerRef = useRef<any>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    const load = async () => {
+      if (!(window as any).L) {
+        if (!document.querySelector('link[data-leaflet="1"]')) {
+          const link = document.createElement("link");
+          link.rel = "stylesheet";
+          link.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+          link.setAttribute("data-leaflet", "1");
+          document.head.appendChild(link);
+        }
+        await new Promise<void>((resolve, reject) => {
+          const existing = document.querySelector('script[data-leaflet="1"]') as HTMLScriptElement | null;
+          if (existing) {
+            if ((window as any).L) resolve();
+            else existing.addEventListener("load", () => resolve(), { once: true });
+            return;
+          }
+          const s = document.createElement("script");
+          s.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+          s.async = true;
+          s.setAttribute("data-leaflet", "1");
+          s.onload = () => resolve();
+          s.onerror = () => reject(new Error("leaflet_load_failed"));
+          document.body.appendChild(s);
+        });
+      }
+      if (!mounted || !ref.current || mapRef.current) return;
+      const L = (window as any).L;
+      mapRef.current = L.map(ref.current).setView([center.lat, center.lng], 13);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: "&copy; OpenStreetMap contributors",
+      }).addTo(mapRef.current);
+      mapRef.current.on("click", (e: any) => {
+        onPick({ lat: e.latlng.lat, lng: e.latlng.lng });
+      });
+    };
+    load().catch(() => void 0);
+    return () => {
+      mounted = false;
+      if (mapRef.current) {
+        mapRef.current.remove();
+        mapRef.current = null;
+        markerRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!mapRef.current) return;
+    const L = (window as any).L;
+    if (selected) {
+      if (!markerRef.current) markerRef.current = L.marker([selected.lat, selected.lng]).addTo(mapRef.current);
+      else markerRef.current.setLatLng([selected.lat, selected.lng]);
+      mapRef.current.setView([selected.lat, selected.lng], Math.max(mapRef.current.getZoom(), 14));
+    } else {
+      mapRef.current.setView([center.lat, center.lng], 13);
+      if (markerRef.current) {
+        mapRef.current.removeLayer(markerRef.current);
+        markerRef.current = null;
+      }
+    }
+  }, [selected, center.lat, center.lng]);
+
+  return <div ref={ref} style={{ width: "100%", height: "280px", borderRadius: "12px", overflow: "hidden", border: `1px solid ${P.border}` }} />;
+};
+
 // ── MAIN APP ──
 export default function App() {
   const PLAN_HISTORY_KEY = "randomTravel.planHistory.v1";
@@ -249,6 +345,8 @@ export default function App() {
   const [gpsErr, setGpsErr] = useState(false);
   const [gpsErrMsg, setGpsErrMsg] = useState("");
   const [gpsAccuracyM, setGpsAccuracyM] = useState<number | null>(null);
+  const [travelLocationMode, setTravelLocationMode] = useState<"gps" | "manual">("gps");
+  const [manualPoint, setManualPoint] = useState<{ lat: number; lng: number } | null>(null);
 
   // 여행 모드 (spin)
   const [spinCat, setSpinCat] = useState<string | null>(null);
@@ -258,12 +356,15 @@ export default function App() {
   const [isSpinning, setIsSpinning] = useState(false);
   const [spinResult, setSpinResult] = useState<{
     pickedName: string; pickedDesc: string; distance: string; direction: string;
-    rating: string; candidates: SpinCandidate[]; pickedIdx: number; source: "real" | "pool"; subLabel?: string;
+    rating: string; candidates: SpinCandidate[]; pickedIdx: number; source: "real" | "pool"; subLabel?: string; noMatch?: boolean;
   } | null>(null);
   const [history, setHistory] = useState<Array<{ cat: string; name: string; distance: string; rating: string; time: string }>>([]);
   const [savedPlans, setSavedPlans] = useState<SavedPlanItem[]>([]);
   const [shareMsg, setShareMsg] = useState("");
   const [currentAddr, setCurrentAddr] = useState<string>("");
+  const [selectedConfigCat, setSelectedConfigCat] = useState<string | null>(null);
+  const [categoryRadii, setCategoryRadii] = useState<Record<string, number>>({ ...DEFAULT_CATEGORY_RADII });
+  const nearbyCacheRef = useRef<Map<string, { at: number; items: SpinCandidate[] }>>(new Map());
 
   useEffect(() => {
     try {
@@ -297,6 +398,21 @@ export default function App() {
       // Ignore localStorage write errors.
     }
   }, [history]);
+
+  useEffect(() => {
+    const inTravelFlow = step === "travel" || step === "spinning" || step === "spin_result";
+    if (inTravelFlow) return;
+
+    // 화면 이탈 시 여행 모드 관련 상태 초기화
+    setSelectedConfigCat(null);
+    setCategoryRadii({ ...DEFAULT_CATEGORY_RADII });
+    setSpinCat(null);
+    setSpinItems([]);
+    setSpinCandidates([]);
+    setSpinFinalIdx(0);
+    setIsSpinning(false);
+    setSpinResult(null);
+  }, [step]);
 
   // ── Participant helpers ──
   const updateP = (id: number, updates: Partial<Participant>) => {
@@ -352,6 +468,9 @@ export default function App() {
     });
   }, []);
 
+  const activeTravelCoords = travelLocationMode === "manual" ? manualPoint : gps;
+  const isManualReady = manualPoint !== null;
+
   const fetchCurrentAddress = useCallback(async (lat: number, lng: number) => {
     type NominatimReverse = {
       display_name?: string;
@@ -380,15 +499,26 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!gps) return;
+    if (travelLocationMode === "manual") {
+      if (!manualPoint) {
+        setCurrentAddr("");
+        return;
+      }
+      fetchCurrentAddress(manualPoint.lat, manualPoint.lng).catch(() => setCurrentAddr(""));
+      return;
+    }
+    if (!gps) {
+      setCurrentAddr("");
+      return;
+    }
     fetchCurrentAddress(gps.lat, gps.lng).catch(() => setCurrentAddr(""));
-  }, [gps, fetchCurrentAddress]);
+  }, [gps, fetchCurrentAddress, travelLocationMode, manualPoint]);
 
   const fetchNearbyCandidates = useCallback(async (
     cat: string,
     lat: number,
     lng: number,
-    opts?: { query?: string; categoryCode?: string; radiusMeters?: number }
+    opts?: { radiusMeters?: number }
   ): Promise<SpinCandidate[]> => {
     type OverpassElement = {
       type: "node" | "way" | "relation";
@@ -400,59 +530,92 @@ export default function App() {
     };
     type OverpassResp = { elements?: OverpassElement[] };
 
-    const radiusMeters = Math.min(
+    const requestedRadiusMeters = Math.min(
       20000,
-      Math.max(500, opts?.radiusMeters ?? Math.round((CATEGORY_META[cat]?.radius ?? 2) * 1000))
+      Math.max(500, opts?.radiusMeters ?? Math.round((categoryRadii[cat] ?? CATEGORY_META[cat]?.radius ?? 5) * 1000))
     );
-    const menuCuisineMap: Record<string, string> = {
-      "국밥": "korean",
-      "칼국수": "noodle",
-      "냉면": "noodle",
-      "돈까스": "japanese",
-      "초밥": "sushi|japanese",
-      "파스타": "italian",
-      "삼겹살": "bbq|barbecue|korean",
-      "해장국": "korean",
-      "쌀국수": "vietnamese|noodle",
-      "치킨": "chicken|korean",
-    };
-
-    const around = `(around:${radiusMeters},${lat},${lng})`;
+    // 작은 반경(0.5~1km)에서 API 누락이 자주 발생해, 조회는 조금 넓게 하고
+    // 최종 후보는 요청 반경으로 정확히 다시 필터링한다.
+    const queryRadiusMeters = Math.min(20000, Math.max(2500, requestedRadiusMeters));
+    const around = `(around:${queryRadiusMeters},${lat},${lng})`;
     const buildByTag = (filters: string[]) => filters
       .map((f) => `node${f}${around};way${f}${around};relation${f}${around};`)
       .join("\n");
 
     let queryBody = "";
     if (cat === "food") {
-      const menu = opts?.query ?? "";
-      const cuisineRegex = menuCuisineMap[menu] || "";
-      const foodFilters = cuisineRegex
-        ? [`["amenity"="restaurant"]["cuisine"~"${cuisineRegex}",i]`, `["amenity"="fast_food"]["cuisine"~"${cuisineRegex}",i]`]
-        : [`["amenity"="restaurant"]`, `["amenity"="fast_food"]`, `["amenity"="food_court"]`];
-      queryBody = buildByTag(foodFilters);
+      queryBody = buildByTag([`["amenity"="restaurant"]`, `["amenity"="fast_food"]`, `["amenity"="food_court"]`]);
     } else if (cat === "cafe") {
-      queryBody = buildByTag([`["amenity"="cafe"]`, `["amenity"="coffee_shop"]`, `["shop"="coffee"]`]);
+      // 카페는 안정적으로 수집되는 태그 중심으로 조회 (과도한 regex는 응답 불안정 유발)
+      queryBody = buildByTag([
+        `["amenity"="cafe"]`,
+        `["shop"="coffee"]`,
+        `["shop"="beverages"]`,
+        `["amenity"="ice_cream"]`,
+      ]);
     } else if (cat === "attraction") {
       queryBody = buildByTag([`["tourism"="attraction"]`, `["tourism"="museum"]`, `["tourism"="viewpoint"]`, `["leisure"="park"]`]);
     } else if (cat === "activity") {
-      queryBody = buildByTag([`["leisure"]`, `["sport"]`, `["tourism"="theme_park"]`, `["tourism"="zoo"]`]);
+      queryBody = buildByTag([
+        `["tourism"="theme_park"]`,
+        `["tourism"="zoo"]`,
+        `["tourism"="aquarium"]`,
+        `["leisure"="sports_centre"]`,
+        `["leisure"="fitness_centre"]`,
+        `["leisure"="swimming_pool"]`,
+        `["leisure"="water_park"]`,
+        `["leisure"="bowling_alley"]`,
+        `["leisure"="amusement_arcade"]`,
+        `["sport"]`,
+        `["amenity"="cinema"]`,
+        `["amenity"="karaoke_box"]`,
+        `["amenity"="billiards"]`,
+      ]);
+    } else if (cat === "lodging") {
+      queryBody = buildByTag([`["tourism"="hotel"]`, `["tourism"="motel"]`, `["tourism"="guest_house"]`, `["tourism"="hostel"]`]);
     } else {
       queryBody = buildByTag([`["place"="town"]`, `["place"="village"]`, `["railway"="station"]`, `["amenity"="bus_station"]`]);
     }
 
-    const overpassQuery = `[out:json][timeout:20];
+    const overpassQuery = `[out:json][timeout:25];
 (
 ${queryBody}
 );
-out center 60;`;
+out center 600;`;
 
-    const res = await fetch(OSM_OVERPASS_BASE, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=UTF-8" },
-      body: overpassQuery,
-    });
-    if (!res.ok) return [];
-    const data = (await res.json()) as OverpassResp;
+    const runOverpass = async (query: string): Promise<OverpassResp | null> => {
+      let data: OverpassResp | null = null;
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const res = await fetch(OSM_OVERPASS_BASE, {
+            method: "POST",
+            headers: { "Content-Type": "text/plain;charset=UTF-8" },
+            body: query,
+          });
+          if (!res.ok) throw new Error(`overpass_http_${res.status}`);
+          data = (await res.json()) as OverpassResp;
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+        }
+      }
+      if (!data && lastErr) throw lastErr;
+      return data;
+    };
+
+    let data: OverpassResp | null = await runOverpass(overpassQuery);
+    if (cat === "cafe" && (!data?.elements || data.elements.length === 0)) {
+      const cafeFallbackQuery = `[out:json][timeout:25];
+(
+${buildByTag([`["amenity"="cafe"]`])}
+);
+out center 600;`;
+      data = await runOverpass(cafeFallbackQuery);
+    }
+    if (!data) throw new Error("overpass_failed");
     const elements = data.elements ?? [];
 
     const popularityOf = (e: OverpassElement, distanceKm: number): number => {
@@ -476,10 +639,11 @@ out center 60;`;
       const pLat = e.lat ?? e.center?.lat;
       const pLng = e.lon ?? e.center?.lon;
       if (pLat === undefined || pLng === undefined) continue;
-      const name = e.tags?.name || e.tags?.brand || e.tags?.official_name;
+      if (cat === "activity" && e.tags?.amenity === "sauna") continue;
+      const name = e.tags?.["name:ko"] || e.tags?.name || e.tags?.["brand:ko"] || e.tags?.brand || e.tags?.official_name;
       if (!name) continue;
       const distanceKm = haversine(lat, lng, pLat, pLng);
-      if (distanceKm > radiusMeters / 1000) continue;
+      if (distanceKm > requestedRadiusMeters / 1000) continue;
       out.push({
         name,
         address: [e.tags?.["addr:city"], e.tags?.["addr:suburb"], e.tags?.["addr:street"]].filter(Boolean).join(" "),
@@ -493,38 +657,22 @@ out center 60;`;
 
     const uniq = new Map<string, SpinCandidate>();
     for (const c of out) {
-      const key = `${c.name}__${c.address ?? ""}`;
+      // 동일 프랜차이즈명을 좌표 없이 합쳐버리면 후보가 과도하게 줄어들기 때문에 좌표를 키에 포함.
+      const latKey = c.lat !== undefined ? c.lat.toFixed(5) : "";
+      const lngKey = c.lng !== undefined ? c.lng.toFixed(5) : "";
+      const key = `${c.name}__${latKey}__${lngKey}`;
       if (!uniq.has(key)) uniq.set(key, c);
     }
     const arr = Array.from(uniq.values());
-    if (cat === "food" || cat === "cafe") {
+    if (cat === "attraction" || cat === "activity" || cat === "nextTown") {
       return arr
-        .sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999))
+        .sort((a, b) => (b.popularity ?? 0) - (a.popularity ?? 0) || (a.distanceKm ?? 999) - (b.distanceKm ?? 999))
         .slice(0, 50);
     }
     return arr
-      .sort((a, b) => (b.popularity ?? 0) - (a.popularity ?? 0) || (a.distanceKm ?? 999) - (b.distanceKm ?? 999))
-      .slice(0, 10);
-  }, []);
-
-  const buildFoodCafePool = useCallback(async (
-    cat: "food" | "cafe",
-    lat: number,
-    lng: number,
-    keyword: string
-  ): Promise<SpinCandidate[]> => {
-    const merged = new Map<string, SpinCandidate>();
-    const byKeyword = await fetchNearbyCandidates(cat, lat, lng, { query: keyword });
-    const byCategory = await fetchNearbyCandidates(cat, lat, lng);
-    for (const c of [...byKeyword, ...byCategory]) {
-      const key = `${c.name}__${c.address ?? ""}`;
-      if (!merged.has(key)) merged.set(key, c);
-    }
-
-    return Array.from(merged.values())
       .sort((a, b) => (a.distanceKm ?? 999) - (b.distanceKm ?? 999))
       .slice(0, 50);
-  }, [fetchNearbyCandidates]);
+  }, [categoryRadii]);
 
   const buildPlanShareText = (p: PlanResult) => {
     const lines = [
@@ -690,47 +838,68 @@ out center 60;`;
     setSpinCat(cat);
     setSpinResult(null);
     setIsSpinning(false);
+    setSpinItems([]);
+    setSpinCandidates([]);
+    setSpinFinalIdx(0);
     setStep("spinning");
 
     let source: "real" | "pool" = "pool";
     let candidates: SpinCandidate[] = [];
     let subLabel = "";
-    if (gps) {
+    const radiusKm = categoryRadii[cat] ?? CATEGORY_META[cat]?.radius ?? 5;
+    const cacheKey = activeTravelCoords
+      ? `${cat}:${activeTravelCoords.lat.toFixed(4)},${activeTravelCoords.lng.toFixed(4)}:${radiusKm.toFixed(1)}`
+      : null;
+    if (activeTravelCoords) {
       try {
-        if (cat === "food") {
-          const menu = pick(FOOD_MENUS);
-          subLabel = `오늘 메뉴: ${menu}`;
-          const pool50 = await buildFoodCafePool("food", gps.lat, gps.lng, menu);
-          if (pool50.length > 0) {
-            candidates = pool50;
+        const nearby = await fetchNearbyCandidates(cat, activeTravelCoords.lat, activeTravelCoords.lng, {
+          radiusMeters: Math.round(radiusKm * 1000),
+        });
+        if (nearby.length > 0) {
+          candidates = nearby;
+          source = "real";
+          subLabel = `후보 ${nearby.length}곳 중 랜덤`;
+          if (cacheKey) nearbyCacheRef.current.set(cacheKey, { at: Date.now(), items: nearby });
+        } else if (cacheKey) {
+          const cached = nearbyCacheRef.current.get(cacheKey);
+          if (cached && Date.now() - cached.at <= CANDIDATE_CACHE_TTL_MS && cached.items.length > 0) {
+            candidates = cached.items;
             source = "real";
-            subLabel = `오늘 메뉴: ${menu} · 주변 ${pool50.length}곳 중 랜덤`;
-          }
-        } else if (cat === "cafe") {
-          const theme = pick(CAFE_THEMES);
-          subLabel = `카페 취향: ${theme}`;
-          const pool50 = await buildFoodCafePool("cafe", gps.lat, gps.lng, theme);
-          if (pool50.length > 0) {
-            candidates = pool50;
-            source = "real";
-            subLabel = `카페 취향: ${theme} · 주변 ${pool50.length}곳 중 랜덤`;
-          }
-        } else {
-          const nearby = await fetchNearbyCandidates(cat, gps.lat, gps.lng);
-          if (nearby.length > 0) {
-            candidates = nearby;
-            source = "real";
-            subLabel = `인기 상위 ${Math.min(10, nearby.length)}곳 중 랜덤`;
+            subLabel = `후보 ${cached.items.length}곳 중 랜덤 (이전 조회값 재사용)`;
           }
         }
       } catch {
-        // Fallback to static pool below.
+        if (cacheKey) {
+          const cached = nearbyCacheRef.current.get(cacheKey);
+          if (cached && Date.now() - cached.at <= CANDIDATE_CACHE_TTL_MS && cached.items.length > 0) {
+            candidates = cached.items;
+            source = "real";
+            subLabel = `후보 ${cached.items.length}곳 중 랜덤 (조회 불안정으로 캐시 사용)`;
+          }
+        }
       }
+    }
+
+    if (candidates.length === 0 && activeTravelCoords) {
+      setSpinResult({
+        pickedName: "조건에 맞는 장소가 없어요",
+        pickedDesc: `설정한 반경(${radiusKm}km) 내 후보를 찾지 못했습니다.`,
+        distance: "-",
+        direction: "-",
+        rating: "-",
+        candidates: [],
+        pickedIdx: -1,
+        source: "real",
+        subLabel: "반경을 넓혀 다시 시도해 주세요.",
+        noMatch: true,
+      });
+      setStep("spin_result");
+      return;
     }
 
     if (candidates.length === 0) {
       const pool = SPIN_POOL[cat] || [];
-      candidates = pickN(pool, 5).map((name) => ({ name }));
+      candidates = pickN(pool, Math.min(5, pool.length)).map((name) => ({ name }));
       source = "pool";
       subLabel = "";
     }
@@ -740,11 +909,11 @@ out center 60;`;
 
     // GPS 기반 거리/방향 계산
     const meta = CATEGORY_META[cat];
-    const dist = (gps && picked.lat !== undefined && picked.lng !== undefined)
-      ? haversine(gps.lat, gps.lng, picked.lat, picked.lng)
+    const dist = (activeTravelCoords && picked.lat !== undefined && picked.lng !== undefined)
+      ? haversine(activeTravelCoords.lat, activeTravelCoords.lng, picked.lat, picked.lng)
       : picked.distanceKm ?? (Math.random() * meta.radius * 0.8 + meta.radius * 0.1);
-    const dir = (gps && picked.lat !== undefined && picked.lng !== undefined)
-      ? bearing(gps, { lat: picked.lat, lng: picked.lng })
+    const dir = (activeTravelCoords && picked.lat !== undefined && picked.lng !== undefined)
+      ? bearing(activeTravelCoords, { lat: picked.lat, lng: picked.lng })
       : (() => {
         const randomAngle = Math.random() * 360;
         const dirs = ["북", "북동", "동", "남동", "남", "남서", "서", "북서"];
@@ -759,7 +928,7 @@ out center 60;`;
       candidates,
       pickedIdx: finalIdx,
       pickedName: picked.name,
-      pickedDesc: gps
+      pickedDesc: activeTravelCoords
         ? `${source === "real" ? "실제 주변 장소" : "주변 추천"} · ${dir}쪽 ${formatDistance(dist)}`
         : `주변 추천 ${meta.label}`,
       distance: formatDistance(dist),
@@ -1106,49 +1275,158 @@ out center 60;`;
           <h2 style={{ fontSize: "22px", fontWeight: "900", color: P.dark, margin: 0 }}>
             {plan?.destination ? `📍 ${plan.destination.name}` : "📍 여행 중"}
           </h2>
-          <div style={{ fontSize: "12px", color: gps ? "#26de81" : P.gray, marginTop: "3px" }}>
-            {gps ? `✅ GPS (${gps.lat.toFixed(4)}, ${gps.lng.toFixed(4)})` : gpsErr ? "⚠️ GPS 사용 불가" : "⏳ GPS 불러오는 중..."}
+          <div style={{ fontSize: "12px", color: activeTravelCoords ? "#26de81" : P.gray, marginTop: "3px" }}>
+            {travelLocationMode === "manual"
+              ? (activeTravelCoords ? `✅ 직접 선택 (${activeTravelCoords.lat.toFixed(4)}, ${activeTravelCoords.lng.toFixed(4)})` : "⚠️ 직접 선택 위치를 지정해 주세요")
+              : (gps ? `✅ GPS (${gps.lat.toFixed(4)}, ${gps.lng.toFixed(4)})` : gpsErr ? "⚠️ GPS 사용 불가" : "⏳ GPS 불러오는 중...")}
           </div>
-          {gps && gpsAccuracyM !== null && (
+          {travelLocationMode === "gps" && gps && gpsAccuracyM !== null && (
             <div style={{ fontSize: "12px", color: P.gray, marginTop: "3px" }}>
               정확도: ±{gpsAccuracyM}m
             </div>
           )}
-          {!gps && gpsErrMsg && (
+          {travelLocationMode === "gps" && !gps && gpsErrMsg && (
             <div style={{ fontSize: "12px", color: "#ef4444", marginTop: "3px" }}>
               {gpsErrMsg}
             </div>
           )}
-          {gps && currentAddr && (
+          {activeTravelCoords && currentAddr && (
             <div style={{ fontSize: "12px", color: P.gray, marginTop: "3px" }}>📌 {currentAddr}</div>
           )}
         </div>
-        <button onClick={getGPS} style={{ background: P.purpleLight, border: "none", borderRadius: "10px", padding: "8px 12px", color: P.purple, fontWeight: "700", fontSize: "12px", cursor: "pointer" }}>GPS 갱신</button>
+        <button
+          onClick={() => travelLocationMode === "gps" && getGPS()}
+          style={{ background: P.purpleLight, border: "none", borderRadius: "10px", padding: "8px 12px", color: P.purple, fontWeight: "700", fontSize: "12px", cursor: travelLocationMode === "gps" ? "pointer" : "not-allowed", opacity: travelLocationMode === "gps" ? 1 : 0.5 }}
+        >
+          GPS 갱신
+        </button>
       </div>
+
+      <Card style={{ marginBottom: "12px", padding: "14px 16px" }}>
+        <div style={{ fontWeight: "700", color: P.dark, fontSize: "13px", marginBottom: "8px" }}>📌 위치 입력 방식</div>
+        <div style={{ display: "flex", gap: "8px", marginBottom: "10px" }}>
+          <button
+            onClick={() => setTravelLocationMode("gps")}
+            style={{
+              flex: 1,
+              padding: "8px 10px",
+              borderRadius: "12px",
+              border: `2px solid ${travelLocationMode === "gps" ? P.purple : P.border}`,
+              background: travelLocationMode === "gps" ? P.purpleLight : P.white,
+              color: travelLocationMode === "gps" ? P.purple : P.gray,
+              fontWeight: "700",
+              cursor: "pointer",
+            }}
+          >
+            GPS 사용
+          </button>
+          <button
+            onClick={() => setTravelLocationMode("manual")}
+            style={{
+              flex: 1,
+              padding: "8px 10px",
+              borderRadius: "12px",
+              border: `2px solid ${travelLocationMode === "manual" ? P.purple : P.border}`,
+              background: travelLocationMode === "manual" ? P.purpleLight : P.white,
+              color: travelLocationMode === "manual" ? P.purple : P.gray,
+              fontWeight: "700",
+              cursor: "pointer",
+            }}
+          >
+            직접 선택
+          </button>
+        </div>
+
+        {travelLocationMode === "manual" && (
+          <div style={{ display: "grid", gap: "8px" }}>
+            <div style={{ fontSize: "12px", color: P.gray }}>
+              지도를 눌러 기준 위치를 찍어 주세요.
+            </div>
+            <MapPicker
+              center={manualPoint ?? gps ?? { lat: 37.5665, lng: 126.978 }}
+              selected={manualPoint}
+              onPick={setManualPoint}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ fontSize: "12px", color: P.gray }}>
+                {manualPoint
+                  ? `선택 좌표: ${manualPoint.lat.toFixed(5)}, ${manualPoint.lng.toFixed(5)}`
+                  : "아직 핀을 선택하지 않았습니다."}
+              </div>
+              <button
+                onClick={() => setManualPoint(null)}
+                style={{
+                  background: "transparent",
+                  border: `1px solid ${P.border}`,
+                  borderRadius: "10px",
+                  padding: "6px 10px",
+                  fontSize: "12px",
+                  color: P.gray,
+                  cursor: "pointer",
+                }}
+              >
+                핀 초기화
+              </button>
+            </div>
+          </div>
+        )}
+      </Card>
 
       {/* 전체 랜덤 */}
       <button onClick={() => { const keys = Object.keys(CATEGORY_META); startSpin(keys[Math.floor(Math.random() * keys.length)]); }}
-        style={{ width: "100%", marginBottom: "12px", padding: "18px", background: `linear-gradient(135deg,${P.purple},${P.pink})`, border: "none", borderRadius: "18px", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: "10px", boxShadow: `0 4px 20px ${P.purple}40` }}>
+        disabled={travelLocationMode === "manual" && !isManualReady}
+        style={{ width: "100%", marginBottom: "12px", padding: "18px", background: `linear-gradient(135deg,${P.purple},${P.pink})`, border: "none", borderRadius: "18px", cursor: travelLocationMode === "manual" && !isManualReady ? "not-allowed" : "pointer", opacity: travelLocationMode === "manual" && !isManualReady ? 0.55 : 1, display: "flex", alignItems: "center", justifyContent: "center", gap: "10px", boxShadow: `0 4px 20px ${P.purple}40` }}>
         <span style={{ fontSize: "28px" }}>🎲</span>
         <div style={{ textAlign: "left" }}>
           <div style={{ fontSize: "16px", fontWeight: "800", color: "white" }}>뭐든 랜덤으로!</div>
           <div style={{ fontSize: "12px", color: "rgba(255,255,255,0.8)" }}>
-            {gps ? "GPS 기반 실제 주변 장소 우선 검색 후 랜덤" : "카테고리부터 장소까지 전부 랜덤"}
+            {activeTravelCoords ? "선택한 위치 기준 실제 주변 장소 검색 후 랜덤" : "위치를 먼저 지정해 주세요"}
           </div>
         </div>
       </button>
 
       {/* 카테고리 선택 */}
-      <div style={{ fontWeight: "700", color: P.gray, fontSize: "12px", marginBottom: "8px" }}>또는 카테고리 직접 선택</div>
+      <div style={{ fontWeight: "700", color: P.gray, fontSize: "12px", marginBottom: "8px" }}>카테고리를 고르면 내부에서 반경 설정 후 랜덤</div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "20px" }}>
         {Object.entries(CATEGORY_META).map(([key, meta]) => (
-          <button key={key} onClick={() => startSpin(key)} style={{ background: meta.bg, border: `2px solid ${meta.color}20`, borderRadius: "16px", padding: "16px 12px", cursor: "pointer", textAlign: "center" }}>
+          <button key={key} onClick={() => setSelectedConfigCat(key)} disabled={travelLocationMode === "manual" && !isManualReady} style={{ background: meta.bg, border: `2px solid ${selectedConfigCat === key ? meta.color : `${meta.color}20`}`, borderRadius: "16px", padding: "16px 12px", cursor: travelLocationMode === "manual" && !isManualReady ? "not-allowed" : "pointer", opacity: travelLocationMode === "manual" && !isManualReady ? 0.55 : 1, textAlign: "center" }}>
             <div style={{ fontSize: "28px" }}>{meta.emoji}</div>
             <div style={{ fontSize: "13px", fontWeight: "700", color: meta.color, marginTop: "4px" }}>{meta.label}</div>
-            <div style={{ fontSize: "11px", color: P.gray, marginTop: "2px" }}>반경 {meta.radius < 1 ? `${meta.radius * 1000}m` : `${meta.radius}km`}</div>
+            <div style={{ fontSize: "11px", color: P.gray, marginTop: "2px" }}>반경 {categoryRadii[key]?.toFixed(1) ?? CATEGORY_META[key].radius}km</div>
           </button>
         ))}
       </div>
+
+      {selectedConfigCat && (
+        <Card style={{ marginBottom: "16px", padding: "14px 16px" }}>
+          <div style={{ fontWeight: "800", color: P.dark, fontSize: "14px", marginBottom: "10px" }}>
+            {CATEGORY_META[selectedConfigCat].emoji} {CATEGORY_META[selectedConfigCat].label} 설정
+          </div>
+
+          <div style={{ marginBottom: "10px" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "6px" }}>
+              <div style={{ fontWeight: "700", color: P.gray, fontSize: "12px" }}>검색 반경</div>
+              <div style={{ fontSize: "12px", color: P.purple, fontWeight: "700" }}>
+                {(categoryRadii[selectedConfigCat] ?? CATEGORY_META[selectedConfigCat].radius).toFixed(1)}km
+              </div>
+            </div>
+            <input
+              type="range"
+              min={0.5}
+              max={getRadiusMaxKm(selectedConfigCat)}
+              step={0.5}
+              value={categoryRadii[selectedConfigCat] ?? CATEGORY_META[selectedConfigCat].radius}
+              onChange={(e) => setCategoryRadii((prev) => ({ ...prev, [selectedConfigCat]: Number(e.target.value) }))}
+              style={{ width: "100%" }}
+            />
+            <div style={{ fontSize: "11px", color: P.gray, marginTop: "4px" }}>
+              최대 {getRadiusMaxKm(selectedConfigCat)}km
+            </div>
+          </div>
+
+          <Btn onClick={() => startSpin(selectedConfigCat)}>🎯 이 조건으로 랜덤 시작</Btn>
+        </Card>
+      )}
 
       {/* 히스토리 */}
       {history.length > 0 && (
@@ -1180,12 +1458,13 @@ out center 60;`;
   // ── SPINNING ──
   if (step === "spinning") {
     const meta = CATEGORY_META[spinCat!] || CATEGORY_META.food;
+    const spinRadiusKm = spinCat ? (categoryRadii[spinCat] ?? meta.radius) : meta.radius;
     return wrap(
       <div style={{ paddingTop: "60px", textAlign: "center" }}>
         <div style={{ fontSize: "48px", marginBottom: "8px" }}>{meta.emoji}</div>
         <h2 style={{ fontSize: "22px", fontWeight: "800", color: P.dark, marginBottom: "4px" }}>{meta.label} 랜덤 선택 중...</h2>
         <p style={{ color: P.gray, fontSize: "13px", marginBottom: "20px" }}>
-          {gps ? `현재 위치 반경 ${meta.radius < 1 ? `${meta.radius * 1000}m` : `${meta.radius}km`} 탐색 중` : `반경 ${meta.radius}km 이내 후보 선별 중`}
+          {gps ? `현재 위치 반경 ${spinRadiusKm < 1 ? `${spinRadiusKm * 1000}m` : `${spinRadiusKm}km`} 탐색 중` : `반경 ${spinRadiusKm}km 이내 후보 선별 중`}
         </p>
         {spinItems.length > 0
           ? <Roulette items={spinItems} finalIdx={spinFinalIdx} spinning={isSpinning} onDone={onSpinDone} />
@@ -1198,6 +1477,18 @@ out center 60;`;
   if (step === "spin_result" && spinResult) {
     const meta = CATEGORY_META[spinCat!] || CATEGORY_META.food;
     const pickedCandidate = spinResult.candidates[spinResult.pickedIdx];
+    const topDistancePreview = spinResult.candidates
+      .map((c) => {
+        const distKm = c.distanceKm ?? (
+          activeTravelCoords && c.lat !== undefined && c.lng !== undefined
+            ? haversine(activeTravelCoords.lat, activeTravelCoords.lng, c.lat, c.lng)
+            : Number.POSITIVE_INFINITY
+        );
+        return { ...c, distKm };
+      })
+      .filter((c) => Number.isFinite(c.distKm))
+      .sort((a, b) => a.distKm - b.distKm)
+      .slice(0, 5);
     const mapViewUrl = pickedCandidate?.lat !== undefined && pickedCandidate?.lng !== undefined
       ? `https://map.kakao.com/link/map/${encodeURIComponent(spinResult.pickedName)},${pickedCandidate.lat},${pickedCandidate.lng}`
       : `https://map.kakao.com/link/search/${encodeURIComponent(spinResult.pickedName)}`;
@@ -1222,28 +1513,44 @@ out center 60;`;
           )}
           <div style={{ display: "flex", gap: "16px" }}>
             <div><div style={{ fontSize: "11px", color: P.gray }}>거리</div><div style={{ fontWeight: "700", color: P.dark }}>{spinResult.distance}</div></div>
-            <div><div style={{ fontSize: "11px", color: P.gray }}>방향</div><div style={{ fontWeight: "700", color: P.dark }}>🧭 {spinResult.direction}쪽</div></div>
+            <div><div style={{ fontSize: "11px", color: P.gray }}>방향</div><div style={{ fontWeight: "700", color: P.dark }}>{spinResult.direction === "-" ? "-" : `🧭 ${spinResult.direction}쪽`}</div></div>
             <div><div style={{ fontSize: "11px", color: P.gray }}>평점</div><div style={{ fontWeight: "700", color: P.dark }}>⭐{spinResult.rating}</div></div>
           </div>
         </Card>
 
-        <Card style={{ marginBottom: "16px" }}>
-          <div style={{ fontWeight: "700", fontSize: "13px", color: P.gray, marginBottom: "10px" }}>📋 이번 후보 목록</div>
-          {spinResult.candidates.map((c, i) => (
-            <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 0", borderBottom: i < spinResult.candidates.length - 1 ? `1px solid ${P.border}` : "none" }}>
-              <span>{i === spinResult.pickedIdx ? "✅" : "⬜"}</span>
-              <span style={{ fontSize: "14px", color: i === spinResult.pickedIdx ? P.dark : P.gray, fontWeight: i === spinResult.pickedIdx ? "700" : "400" }}>
-                {c.name}{c.address ? ` · ${c.address}` : ""}
-              </span>
-            </div>
-          ))}
-        </Card>
+        {!spinResult.noMatch && (
+          <Card style={{ marginBottom: "16px" }}>
+            {topDistancePreview.length > 0 && (
+              <div style={{ marginBottom: "12px", borderBottom: `1px solid ${P.border}`, paddingBottom: "10px" }}>
+                <div style={{ fontWeight: "700", fontSize: "13px", color: P.gray, marginBottom: "6px" }}>📍 실제 거리순 상위 {topDistancePreview.length}개</div>
+                {topDistancePreview.map((c, i) => (
+                  <div key={`${c.name}-${i}`} style={{ fontSize: "13px", color: P.dark, marginBottom: "4px" }}>
+                    {i + 1}. {c.name} · {formatDistance(c.distKm)}
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{ fontWeight: "700", fontSize: "13px", color: P.gray, marginBottom: "10px" }}>📋 이번 후보 목록</div>
+            {spinResult.candidates.map((c, i) => (
+              <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px", padding: "6px 0", borderBottom: i < spinResult.candidates.length - 1 ? `1px solid ${P.border}` : "none" }}>
+                <span>{i === spinResult.pickedIdx ? "✅" : "⬜"}</span>
+                <span style={{ fontSize: "14px", color: i === spinResult.pickedIdx ? P.dark : P.gray, fontWeight: i === spinResult.pickedIdx ? "700" : "400" }}>
+                  {c.name}{c.address ? ` · ${c.address}` : ""}
+                </span>
+              </div>
+            ))}
+          </Card>
+        )}
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "10px", marginBottom: "10px" }}>
-          <a href={mapViewUrl} target="_blank" rel="noopener noreferrer"
-            style={{ display: "block", background: "#FEE500", color: "#3A1D1D", border: "none", borderRadius: "14px", padding: "13px", fontSize: "14px", fontWeight: "700", textAlign: "center", textDecoration: "none" }}>
-            🗺️ 카카오맵에서 위치 보기
-          </a>
+          {spinResult.noMatch ? (
+            <Btn variant="secondary" onClick={() => setStep("travel")}>🔧 조건 다시 설정</Btn>
+          ) : (
+            <a href={mapViewUrl} target="_blank" rel="noopener noreferrer"
+              style={{ display: "block", background: "#FEE500", color: "#3A1D1D", border: "none", borderRadius: "14px", padding: "13px", fontSize: "14px", fontWeight: "700", textAlign: "center", textDecoration: "none" }}>
+              🗺️ 카카오맵에서 위치 보기
+            </a>
+          )}
           <Btn variant="outline" onClick={() => startSpin(spinCat!)}>🔄 다시 뽑기</Btn>
         </div>
         <Btn onClick={() => setStep("travel")}>← 여행 모드로 돌아가기</Btn>
